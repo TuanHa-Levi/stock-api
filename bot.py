@@ -207,6 +207,7 @@ def format_combo_message(d: dict) -> str:
     tp      = d.get("trade_plan", {})
     mtf     = d.get("mtf", {})
     cf      = d.get("confluence", {})
+    sdca    = d.get("smart_dca", {})
 
     chg_arrow = "📈" if chg >= 0 else "📉"
     chg_sign  = "+" if chg >= 0 else ""
@@ -222,6 +223,103 @@ def format_combo_message(d: dict) -> str:
 
     # MASTER decision
     master_vi, master_reason, master_action = calc_master_decision(mtf, tp, cf)
+
+    # Smart DCA
+    regime       = sdca.get("regime", "—")
+    regime_note  = sdca.get("regime_note", "")
+    best_zone    = sdca.get("best_zone_str", "—")
+    best_stars   = sdca.get("best_zone_stars", "")
+    best_sources = sdca.get("best_zone_sources", [])
+    best_dist    = sdca.get("best_zone_dist_pct", 0)
+    breakout     = sdca.get("breakout_entry")
+    adx_val      = sdca.get("adx", 0)
+
+    # Format sources ngắn gọn
+    src_str = " + ".join(best_sources[:4]) + (" ..." if len(best_sources) > 4 else "")
+
+    # Khoảng cách đến vùng DCA
+    if abs(best_dist) < 1:
+        dist_str = "🎯 Đang ở trong vùng DCA"
+    elif best_dist < 0:
+        dist_str = f"Cách {abs(best_dist):.1f}% — chờ pullback"
+    else:
+        dist_str = f"Giá đã về vùng DCA (+{best_dist:.1f}%)"
+
+    lines = [
+        f"{'━'*34}",
+        f"📊 *{sym}* | {date}",
+        f"{chg_arrow} Giá: *{fmt_price(price)}* ({chg_sign}{chg_pct:.1f}%)",
+        f"📦 Vol: {d['volume']/1e6:.1f}M ({d['vol_ratio']:.1f}x TB20)",
+        f"{'━'*34}",
+        f"",
+        # ── MASTER DECISION ──
+        f"🏁 *QUYẾT ĐỊNH: {master_vi}*",
+        f"_{master_reason}_",
+        f"➡️ *{master_action}*",
+        f"",
+        f"{'━'*34}",
+        f"",
+        # ── Smart DCA ──
+        f"💰 *VÙNG DCA TỐT NHẤT* [{regime} | ADX {adx_val:.0f}]",
+        f"  *{best_zone}* {best_stars}",
+        f"  _{src_str}_",
+        f"  {dist_str}",
+    ]
+
+    # Breakout entry nếu zone xa >8%
+    if breakout:
+        lines += [
+            f"  ⚡ *Breakout entry:* {fmt_price(breakout['price'])}",
+            f"  _{breakout['note']}_",
+        ]
+
+    lines += [
+        f"",
+        f"{'─'*34}",
+        # ── MTF ──
+        f"🌐 *MTF: {mtf_total}/100* `{bar_mtf}`",
+        f"  M *{mtf.get('monthly_score',0)}* | W *{mtf.get('weekly_score',0)}* | D *{score}*",
+        f"  M: _{mtf.get('monthly_note','')}_",
+        f"  W: _{mtf.get('weekly_note','')}_",
+    ]
+
+    if mtf.get("monthly_warning"):
+        lines.append(f"  {mtf.get('monthly_warning')}")
+
+    lines += [
+        f"",
+        # ── Confluence ──
+        f"🔍 *Confluence: {cf_score}/40 — {cf.get('level','')}*",
+    ]
+    for sig_val in cf.get("signals", {}).values():
+        lines.append(f"  {sig_val}")
+
+    lines += [
+        f"",
+        f"{'─'*34}",
+        # ── Hỗ trợ & Kháng cự ──
+        f"📐 *Hỗ trợ:* {fmt_price(tp.get('support_1'))} → {fmt_price(tp.get('support_2'))} → {fmt_price(tp.get('support_3'))}",
+        f"📐 *Kháng cự:* {fmt_price(tp.get('resistance'))}",
+        f"",
+    ]
+
+    # Tín hiệu thoát
+    if reversal >= 1:
+        bad = [sig for sig, st in tp.get("reversal_detail", {}).items() if "XẤU" in st]
+        lines += [
+            f"⚠️ *Cảnh báo thoát ({reversal}/5):* {' | '.join(bad)}",
+            f"",
+        ]
+
+    lines += [
+        f"{'━'*34}",
+        f"📈 *Daily: {score}/100* `{bar_daily}` | ST: *{d['supertrend']}* | RSI {d['rsi14']:.0f}",
+        f"C1:{d['combo1']['score']}% C2:{d['combo2']['score']}% C3:{d['combo3']['score']}% C4:{d['combo4']['score']}% C5:{d['combo5']['score']}%",
+        f"EMA {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f} | OBV:{d['obv_trend']} CMF:{d['cmf20']:+.3f}",
+        f"Dòng tiền: *{tp.get('money_flow','—')}* | Trend: *{tp.get('trend_quality','—')}*",
+    ]
+
+    return "\n".join(lines)
 
     lines = [
         f"{'━'*34}",
@@ -318,9 +416,10 @@ def ask_claude(prompt: str) -> str:
         return f"❌ Claude API lỗi: {str(e)[:100]}"
 
 def claude_with_combo(symbol: str, d: dict) -> str:
-    tp  = d.get("trade_plan", {})
-    mtf = d.get("mtf", {})
-    cf  = d.get("confluence", {})
+    tp   = d.get("trade_plan", {})
+    mtf  = d.get("mtf", {})
+    cf   = d.get("confluence", {})
+    sdca = d.get("smart_dca", {})
 
     reversal_lines = "\n".join(
         f"  {status}: {sig}" for sig, status in tp.get("reversal_detail", {}).items()
@@ -328,6 +427,57 @@ def claude_with_combo(symbol: str, d: dict) -> str:
     cf_lines = "\n".join(
         f"  {v}" for v in cf.get("signals", {}).values()
     )
+
+    # Smart DCA context
+    regime      = sdca.get("regime", "—")
+    best_zone   = sdca.get("best_zone_str", "—")
+    best_stars  = sdca.get("best_zone_stars", "")
+    best_sources= ", ".join(sdca.get("best_zone_sources", []))
+    best_dist   = sdca.get("best_zone_dist_pct", 0)
+    breakout    = sdca.get("breakout_entry")
+    fib         = sdca.get("fib") or {}
+    pivot       = sdca.get("pivot") or {}
+    vp          = sdca.get("vp") or {}
+
+    breakout_line = f"- Breakout entry: {fmt_price(breakout['price'])} ({breakout['note']})" if breakout else ""
+    fib_line = (f"- Fib 38.2%/50%/61.8%: {fmt_price(fib.get('fib_382'))}/{fmt_price(fib.get('fib_500'))}/{fmt_price(fib.get('fib_618'))}"
+                if fib else "")
+    pivot_line = (f"- Pivot S1/S2: {fmt_price(pivot.get('s1'))}/{fmt_price(pivot.get('s2'))}"
+                  if pivot else "")
+    poc_line = (f"- Volume POC/VAL: {fmt_price(vp.get('poc'))}/{fmt_price(vp.get('val'))}"
+                if vp else "")
+
+    prompt = (
+        f"Phân tích dài hạn {symbol} ngày {d['date']}:\n"
+        f"- Giá hiện tại: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n"
+        f"- EMA9/20/50: {fmt_price(d['ema9'])}/{fmt_price(d['ema20'])}/{fmt_price(d['ema50'])}\n"
+        f"- BB Upper/Lower: {fmt_price(d.get('bb_upper'))}/{fmt_price(d.get('bb_lower'))}\n\n"
+        f"[MTF: {mtf.get('mtf_total',0)}/100 — {mtf.get('decision_vi','')}]\n"
+        f"- Monthly {mtf.get('monthly_score',0)}: {mtf.get('monthly_note','')}\n"
+        f"- Weekly  {mtf.get('weekly_score',0)}: {mtf.get('weekly_note','')}\n"
+        f"- Daily   {d['total_score']}: {tp.get('decision_vi','')}\n"
+        f"{('- ⚠️ ' + mtf.get('monthly_warning','')) if mtf.get('monthly_warning') else ''}\n\n"
+        f"[CONFLUENCE: {cf.get('score',0)}/40 — {cf.get('level','')}]\n"
+        f"{cf_lines}\n\n"
+        f"[KỸ THUẬT]\n"
+        f"- ST: {d['supertrend']} | RSI: {d['rsi14']:.1f} | MACD: {d['macd']:+.3f} | OBV: {d['obv_trend']}\n"
+        f"- Tín hiệu thoát ({tp.get('reversal_count',0)}/5):\n{reversal_lines}\n\n"
+        f"[SMART DCA — Regime: {regime} | {best_stars}]\n"
+        f"- Vùng DCA tốt nhất: {best_zone} ({best_dist:+.1f}% từ giá hiện tại)\n"
+        f"- Chỉ báo hội tụ: {best_sources}\n"
+        f"{fib_line}\n{pivot_line}\n{poc_line}\n"
+        f"{breakout_line}\n"
+        f"- Hỗ trợ: {fmt_price(tp.get('support_1'))} / {fmt_price(tp.get('support_2'))} / {fmt_price(tp.get('support_3'))}\n"
+        f"- Kháng cự: {fmt_price(tp.get('resistance'))}\n\n"
+        f"Yêu cầu output CHÍNH XÁC theo format sau (không thêm bớt):\n"
+        f"Quyết định: [MUA THÊM 🟢 / NẮM GIỮ ⚪ / THOÁT 🔴]\n"
+        f"📌 Giá mua / DCA: [dùng vùng Smart DCA ở trên, ghi rõ lý do chỉ báo hội tụ]\n"
+        f"📌 Giá vào lệnh mới: [vùng DCA tốt nhất nếu chưa có vị thế]\n"
+        f"📌 Chốt lời một phần: [mức kháng cự gần nhất hoặc 'Chưa — tiếp tục giữ']\n"
+        f"📌 Thoát lệnh khi: [điều kiện chỉ báo cụ thể, KHÔNG dùng giá cố định]\n"
+        f"[1-2 câu nhận định ngắn gọn lý do và rủi ro chính]"
+    )
+    return ask_claude(prompt)
 
     # Truyền đầy đủ giá tham chiếu để Claude output đúng mức giá
     prompt = (
