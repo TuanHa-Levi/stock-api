@@ -489,82 +489,174 @@ def run_combo_analysis(symbol):
         action  = "BÁN MẠNH"
         emoji   = "🔴🔴🔴"
 
-    # ── Entry / SL / TP theo ATR ──
-    entry   = latest_close
-    sl      = round(entry - 1.5 * atr14, 2)
-    sl_pct  = round((sl - entry) / entry * 100, 1)
-    tp1     = round(entry + 2.0 * atr14, 2)
-    tp2     = round(entry + 3.5 * atr14, 2)
-    tp1_pct = round((tp1 - entry) / entry * 100, 1)
-    tp2_pct = round((tp2 - entry) / entry * 100, 1)
-    rr1     = round(abs(tp1_pct / sl_pct), 1) if sl_pct != 0 else 0
-
     # ══════════════════════════════════════════════════════════
-    # TRADE DECISION ENGINE — Quyết định giao dịch cụ thể
+    # LONG-TERM TRADE DECISION ENGINE v2
+    # Triết lý: không dùng SL/TP cố định.
+    # Mua theo vùng EMA hỗ trợ (3 tầng DCA).
+    # Giữ khi xu hướng còn tích cực.
+    # Thoát chỉ khi ≥3/5 tín hiệu đảo chiều xác nhận.
     # ══════════════════════════════════════════════════════════
-    entry_low  = round(entry - 0.3 * atr14, 2)
-    entry_high = round(entry + 0.2 * atr14, 2)
-    sl_trail   = round(max(sl, ema20 * 0.985), 2)
 
+    # ── 1. Trạng thái xu hướng ──
+    trend_strong    = bool(st_dir == "BULL" and ema9 > ema20 > ema50 and latest_close > ema9)
     trend_confirmed = bool(st_dir == "BULL" and ema9 > ema20 > ema50)
+    trend_weak      = bool(latest_close > ema50 and (ema9 > ema20 or st_dir == "BULL"))
     money_flow_in   = bool(obv_trend == "UP" and cmf20 > 0)
     money_flow_out  = bool(obv_trend == "DOWN" and cmf20 < 0)
-    trend_broken    = bool(st_dir == "BEAR" and latest_close < ema20)
 
-    if total_score >= 70 and trend_confirmed and money_flow_in:
-        decision      = "MUA_NGAY"
-        decision_vi   = "🟢🟢 MUA NGAY"
-        decision_note = "Tín hiệu đủ mạnh — vào lệnh MUA tại giá thị trường"
-        wait_buy      = entry_low
-        wait_buy_note = f"Mua ngay hoặc chờ pullback về {entry_low:,.2f}"
-    elif total_score >= 55 and (trend_confirmed or bool(macd_cross_up)):
-        decision      = "CHO_MUA"
-        decision_vi   = "🟡 ĐẶT LỆNH CHỜ MUA"
-        decision_note = "Xu hướng tốt nhưng chưa đủ xác nhận — đặt lệnh chờ"
-        wait_buy      = entry_low
-        wait_buy_note = f"Đặt lệnh chờ mua tại {entry_low:,.2f} (pullback về EMA/hỗ trợ)"
-    elif total_score >= 45:
-        decision      = "THEO_DOI"
-        decision_vi   = "⚪ THEO DÕI — CHƯA VÀO LỆNH"
-        decision_note = "Tín hiệu chưa rõ — chờ breakout xác nhận mới vào lệnh"
-        wait_buy      = entry_high
-        wait_buy_note = f"Chờ breakout vượt {entry_high:,.2f} kèm volume > {int(vol_ma20*1.5):,}"
-    elif total_score >= 30 and trend_broken:
-        decision      = "CHO_BAN"
-        decision_vi   = "🔴 ĐẶT LỆNH CHỜ BÁN"
-        decision_note = "Xu hướng xấu đi — bán nếu đang giữ, không mua mới"
-        wait_buy      = None
-        wait_buy_note = "Không mua — chờ xác nhận đáy và tín hiệu đảo chiều"
+    # ── 2. Điều kiện GIỮ VỮNG — không bán dù có pullback ──
+    # Dài hạn: pullback về EMA là cơ hội mua thêm, không phải bán
+    hold_ok = bool(
+        st_dir == "BULL"              # xu hướng chính vẫn tăng
+        and latest_close > ema50      # giá trên đường trung bình dài hạn
+        and rsi14 > 35                # momentum không sụp đổ (nới rộng cho DH)
+        and obv_trend == "UP"         # tổ chức chưa rút tiền
+    )
+
+    # ── 3. Hệ thống 5 tín hiệu THOÁT dài hạn ──
+    # Cần ≥ 3/5 để xác nhận đảo chiều — tránh false signal ngắn hạn
+    exit_signals = {
+        "supertrend_bear":     bool(st_dir == "BEAR"),
+        "death_cross":         bool(ema20 < ema50),
+        "price_below_ema50":   bool(latest_close < ema50),
+        "rsi_breakdown":       bool(rsi14 < 40 and mom5 < -3),
+        "money_flow_out":      bool(money_flow_out and mfi14 < 45),
+    }
+    reversal_count  = sum(exit_signals.values())
+    trend_reversed  = reversal_count >= 3
+
+    # ── 4. Vùng DCA 3 tầng — mua theo pullback ──
+    # Tầng 1 — Mua lý tưởng: pullback về EMA20 (hỗ trợ ngắn hạn)
+    dca_zone1_low  = round(ema20 * 0.99, 2)
+    dca_zone1_high = round(ema20 * 1.01, 2)
+    # Tầng 2 — Mua tốt: pullback về EMA50 (hỗ trợ trung hạn)
+    dca_zone2_low  = round(ema50 * 0.99, 2)
+    dca_zone2_high = round(ema50 * 1.01, 2)
+    # Tầng 3 — Mua mạnh tay: về BB lower / vùng oversold (cơ hội DCA tốt nhất)
+    dca_zone3_low  = round(bb_lower * 0.99, 2) if bb_lower else round(ema50 * 0.94, 2)
+    dca_zone3_high = round(bb_lower * 1.01, 2) if bb_lower else round(ema50 * 0.96, 2)
+
+    # Giá hiện tại đang ở tầng nào?
+    dist_ema20_pct = round((latest_close - ema20) / ema20 * 100, 1)
+    dist_ema50_pct = round((latest_close - ema50) / ema50 * 100, 1)
+    if latest_close <= dca_zone3_high:
+        dca_current_zone = "TẦNG 3 🔥 (vùng oversold — mua mạnh nhất)"
+    elif latest_close <= dca_zone2_high:
+        dca_current_zone = "TẦNG 2 ✅ (EMA50 — mua tốt)"
+    elif latest_close <= dca_zone1_high:
+        dca_current_zone = "TẦNG 1 ✅ (EMA20 — mua lý tưởng)"
     else:
-        decision      = "BAN_NGAY"
-        decision_vi   = "🔴🔴 BÁN / KHÔNG THAM GIA"
-        decision_note = "Tín hiệu xấu toàn diện — bán nếu đang giữ, tránh mua mới"
-        wait_buy      = None
-        wait_buy_note = "Không mua — đợi thị trường hồi phục và có tín hiệu mới"
+        gap_to_ema20 = dist_ema20_pct
+        dca_current_zone = f"Trên vùng DCA ({gap_to_ema20:+.1f}% so EMA20) — chờ pullback"
+
+    # ── 5. Vùng hỗ trợ & kháng cự động ──
+    support_1  = round(min(ema20, st_val if st_val else ema20), 2)
+    support_2  = round(ema50, 2)
+    support_3  = round(bb_lower, 2) if bb_lower else round(ema50 * 0.95, 2)
+    resistance = round(bb_upper, 2) if bb_upper else round(latest_close * 1.05, 2)
+
+    # ── 6. Ra quyết định dài hạn ──
+    if trend_reversed:
+        decision      = "THOAT_LENH"
+        decision_vi   = "🔴🔴 THOÁT LỆNH DÀI HẠN"
+        decision_note = f"Đảo chiều xác nhận {reversal_count}/5 tín hiệu — xu hướng tăng đã kết thúc"
+        action_detail = "Giảm tỷ trọng mạnh hoặc thoát toàn bộ. Theo dõi để tái tích lũy ở vùng đáy mới"
+
+    elif reversal_count == 2:
+        decision      = "CANH_THOAT"
+        decision_vi   = "🟠 CẢNH BÁO — SẴN SÀNG THOÁT"
+        decision_note = f"2/5 tín hiệu đảo chiều — chưa xác nhận nhưng rủi ro tăng cao"
+        action_detail = f"Không mua thêm. Đặt ngưỡng thoát nếu thêm 1 tín hiệu nữa xác nhận"
+
+    elif total_score >= 70 and trend_strong and money_flow_in:
+        decision      = "MUA_MANH"
+        decision_vi   = "🟢🟢 MUA MẠNH / TĂNG TỶ TRỌNG"
+        decision_note = "Xu hướng rất mạnh, dòng tiền vào rõ ràng — thời điểm tốt để tích lũy"
+        action_detail = f"Mua ngay hoặc chờ pullback về Tầng 1: {dca_zone1_low:,.2f}–{dca_zone1_high:,.2f}"
+
+    elif total_score >= 55 and trend_confirmed:
+        decision      = "TICH_LUY"
+        decision_vi   = "🟢 TÍCH LŨY / MUA THÊM"
+        decision_note = "Xu hướng tăng xác nhận — tích lũy theo DCA khi giá về vùng EMA"
+        action_detail = f"DCA tại Tầng 1 ({dca_zone1_low:,.2f}–{dca_zone1_high:,.2f}) hoặc Tầng 2 ({dca_zone2_low:,.2f}–{dca_zone2_high:,.2f})"
+
+    elif hold_ok:
+        decision      = "NAM_GIU"
+        decision_vi   = "⚪ NẮM GIỮ VỮNG"
+        decision_note = "Chỉ báo tích cực, xu hướng còn nguyên — không có lý do bán"
+        action_detail = f"Tiếp tục giữ. Có thể DCA thêm nếu giá về Tầng 2: {dca_zone2_low:,.2f}–{dca_zone2_high:,.2f}"
+
+    elif trend_weak and not money_flow_out:
+        decision      = "THEO_DOI"
+        decision_vi   = "🟡 THEO DÕI — GIỮ CÓ ĐIỀU KIỆN"
+        decision_note = "Xu hướng yếu dần nhưng chưa đảo chiều — không mua thêm, theo dõi chặt"
+        action_detail = f"Giữ nếu chưa phá EMA50 ({support_2:,.2f}). Sẵn sàng thoát nếu thêm tín hiệu xấu"
+
+    else:
+        decision      = "TRANH_XA"
+        decision_vi   = "🔴 TRÁNH XA — CHƯA VÀO"
+        decision_note = "Xu hướng không rõ hoặc đang tích lũy đáy — chưa phải thời điểm"
+        action_detail = f"Chờ giá ổn định và xác nhận lại trên EMA50 ({support_2:,.2f}) với volume tốt"
+
+    # ── 7. Trạng thái giữ ──
+    if hold_ok and not trend_reversed:
+        hold_status = "✅ GIỮ VỮNG"
+        hold_reason = "SuperTrend BULL + giá trên EMA50 + OBV tăng → chưa có lý do bán"
+    elif reversal_count == 1:
+        hold_status = "⚠️ GIỮ CÓ ĐIỀU KIỆN"
+        hold_reason = f"1/5 tín hiệu cảnh báo — theo dõi chặt, chưa phải thoát"
+    elif reversal_count == 2:
+        hold_status = "🟠 RỦI RO CAO — CÂN NHẮC THOÁT"
+        hold_reason = f"2/5 tín hiệu xấu — chuẩn bị thoát nếu thêm 1 tín hiệu nữa"
+    elif trend_reversed:
+        hold_status = "❌ THOÁT LỆNH"
+        hold_reason = f"3+/5 tín hiệu đảo chiều — xu hướng dài hạn đã phá vỡ"
+    else:
+        hold_status = "⚠️ THEO DÕI"
+        hold_reason = "Chỉ báo chưa rõ xu hướng — không mua thêm, theo dõi"
+
+    # ── 8. Mô tả chi tiết 5 tín hiệu thoát ──
+    exit_detail = {
+        "SuperTrend đổi BEAR":              exit_signals["supertrend_bear"],
+        f"Death cross EMA20 < EMA50":        exit_signals["death_cross"],
+        f"Giá dưới EMA50 ({ema50:,.2f})":    exit_signals["price_below_ema50"],
+        f"RSI<40 & Momentum<-3%":            exit_signals["rsi_breakdown"],
+        f"OBV giảm & MFI<45":               exit_signals["money_flow_out"],
+    }
 
     trade_plan = {
+        # Quyết định chính
         "decision":           decision,
         "decision_vi":        decision_vi,
         "decision_note":      decision_note,
-        "wait_buy":           wait_buy,
-        "wait_buy_note":      wait_buy_note,
-        "entry_zone_low":     entry_low,
-        "entry_zone_high":    entry_high,
-        "cut_loss":           sl,
-        "cut_loss_trail":     sl_trail,
-        "cut_loss_pct":       sl_pct,
-        "cut_loss_note":      f"Cắt lỗ khi giá đóng cửa dưới {sl:,.2f} ({sl_pct:+.1f}%)",
-        "take_profit_1":      tp1,
-        "take_profit_1_pct":  tp1_pct,
-        "take_profit_1_note": f"Chốt 50% vị thế tại {tp1:,.2f} (+{tp1_pct:.1f}%)",
-        "take_profit_2":      tp2,
-        "take_profit_2_pct":  tp2_pct,
-        "take_profit_2_note": f"Chốt 50% còn lại tại {tp2:,.2f} (+{tp2_pct:.1f}%)",
-        "rr_ratio":           rr1,
-        "rr_note":            f"Rủi ro {abs(sl_pct):.1f}% — Lợi nhuận {tp1_pct:.1f}% (R:R = 1:{rr1})",
-        "trigger_buy":        f"Nến đóng cửa trên {entry_high:,.2f} + Volume > {int(vol_ma20*1.3):,}",
-        "trigger_sell":       f"Nến đóng cửa dưới {sl:,.2f} hoặc SuperTrend đổi BEAR",
-        "trend_quality":      "TỐT" if trend_confirmed else ("TRUNG BÌNH" if total_score >= 45 else "XẤU"),
+        "action_detail":      action_detail,
+        # Trạng thái giữ
+        "hold_status":        hold_status,
+        "hold_reason":        hold_reason,
+        "hold_ok":            bool(hold_ok),
+        # Vùng DCA 3 tầng
+        "dca_zone1":          f"{dca_zone1_low:,.2f}–{dca_zone1_high:,.2f}",
+        "dca_zone2":          f"{dca_zone2_low:,.2f}–{dca_zone2_high:,.2f}",
+        "dca_zone3":          f"{dca_zone3_low:,.2f}–{dca_zone3_high:,.2f}",
+        "dca_current_zone":   dca_current_zone,
+        "dca_note":           f"Tầng 1 (EMA20) | Tầng 2 (EMA50) | Tầng 3 (BB Lower)",
+        # Khoảng cách giá vs EMA
+        "dist_ema20_pct":     dist_ema20_pct,
+        "dist_ema50_pct":     dist_ema50_pct,
+        "dist_note":          f"Cách EMA20: {dist_ema20_pct:+.1f}% | Cách EMA50: {dist_ema50_pct:+.1f}%",
+        # Vùng hỗ trợ / kháng cự
+        "support_1":          support_1,
+        "support_2":          support_2,
+        "support_3":          support_3,
+        "resistance":         resistance,
+        "levels_note":        f"Hỗ trợ: {support_1:,.2f} → {support_2:,.2f} → {support_3:,.2f} | Kháng cự: {resistance:,.2f}",
+        # Hệ thống 5 tín hiệu thoát
+        "reversal_count":     reversal_count,
+        "reversal_detail":    {k: ("⚠️ XẤU" if v else "✅ OK") for k, v in exit_detail.items()},
+        "trend_reversed":     bool(trend_reversed),
+        "exit_threshold":     "Thoát khi ≥3/5 tín hiệu kích hoạt",
+        # Chất lượng tín hiệu
+        "trend_quality":      "MẠNH" if trend_strong else ("TỐT" if trend_confirmed else ("YẾU" if trend_weak else "XẤU")),
         "money_flow":         "VÀO" if money_flow_in else ("RA" if money_flow_out else "TRUNG LẬP"),
         "signal_quality":     f"{total_score}/100",
     }
@@ -613,14 +705,8 @@ def run_combo_analysis(symbol):
         "overall":     overall,
         "action":      action,
         "emoji":       emoji,
-        "entry":       entry,
-        "sl":          sl,
-        "sl_pct":      sl_pct,
-        "tp1":         tp1,
-        "tp2":         tp2,
-        "tp1_pct":     tp1_pct,
-        "tp2_pct":     tp2_pct,
-        "rr_ratio":    rr1,
+        "entry":       latest_close,
+        "atr14":       atr14,
         "trade_plan":  trade_plan,
     }, None
 
