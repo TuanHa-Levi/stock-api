@@ -136,6 +136,8 @@ def format_combo_message(d: dict) -> str:
     date    = d["date"]
     score   = d["total_score"]
     tp      = d.get("trade_plan", {})
+    mtf     = d.get("mtf", {})
+    cf      = d.get("confluence", {})
 
     chg_arrow = "📈" if chg >= 0 else "📉"
     chg_sign  = "+" if chg >= 0 else ""
@@ -144,6 +146,11 @@ def format_combo_message(d: dict) -> str:
     decision  = tp.get("decision", "")
     reversal  = tp.get("reversal_count", 0)
 
+    # MTF bar
+    mtf_total = mtf.get("mtf_total", 0)
+    mtf_filled = int(mtf_total / 10)
+    mtf_bar    = "█" * mtf_filled + "░" * (10 - mtf_filled)
+
     lines = [
         f"{'━'*34}",
         f"📊 *{sym}* | {date}",
@@ -151,7 +158,43 @@ def format_combo_message(d: dict) -> str:
         f"📦 Vol: {d['volume']/1e6:.1f}M ({d['vol_ratio']:.1f}x TB20)",
         f"{'━'*34}",
         f"",
-        f"🎯 *QUYẾT ĐỊNH DÀI HẠN*",
+    ]
+
+    # ── Block MTF Decision (ưu tiên cao nhất) ──
+    if mtf:
+        mtf_warn = mtf.get("monthly_warning")
+        lines += [
+            f"🌐 *MTF DECISION: {mtf_total}/100* `{mtf_bar}`",
+            f"{mtf.get('decision_vi','—')}",
+            f"_{mtf.get('weights','')}_",
+        ]
+        if mtf_warn:
+            lines.append(f"{mtf_warn}")
+        lines += [
+            f"💰 DCA: _{mtf.get('dca_note','—')}_",
+            f"",
+            f"  Monthly *{mtf.get('monthly_score',0)}* | Weekly *{mtf.get('weekly_score',0)}* | Daily *{score}*",
+            f"  M: _{mtf.get('monthly_note','')}_",
+            f"  W: _{mtf.get('weekly_note','')}_",
+            f"",
+        ]
+
+    # ── Block Confluence ──
+    if cf:
+        cf_score = cf.get("score", 0)
+        cf_level = cf.get("level", "")
+        lines += [
+            f"{'─'*34}",
+            f"🔍 *CONFLUENCE: {cf_score}/40 — {cf_level}*",
+        ]
+        for sig_name, sig_val in cf.get("signals", {}).items():
+            lines.append(f"  {sig_val}")
+        lines.append("")
+
+    # ── Block Trade Plan (dài hạn) ──
+    lines += [
+        f"{'─'*34}",
+        f"🎯 *QUYẾT ĐỊNH DÀI HẠN (Daily)*",
         f"{tp.get('decision_vi', '—')}",
         f"_{tp.get('decision_note', '')}_",
         f"",
@@ -159,50 +202,45 @@ def format_combo_message(d: dict) -> str:
         f"",
     ]
 
-    # ── Trạng thái nắm giữ ──
+    # Trạng thái nắm giữ
     lines += [
-        f"{'─'*34}",
-        f"📌 *TRẠNG THÁI NẮM GIỮ:*",
-        f"  {tp.get('hold_status', '')}",
+        f"📌 *NẮM GIỮ:* {tp.get('hold_status', '')}",
         f"  _{tp.get('hold_reason', '')}_",
         f"",
     ]
 
-    # ── DCA zones (khi nên mua thêm) ──
+    # DCA zones
     if decision in ["MUA_MANH", "TICH_LUY", "NAM_GIU", "THEO_DOI"]:
         lines += [
-            f"{'─'*34}",
-            f"💰 *VÙNG DCA — MUA THEO PULLBACK:*",
+            f"💰 *VÙNG DCA:*",
             f"  🟢 Tầng 1 (EMA20): *{tp.get('dca_zone1', '—')}*",
             f"  🟡 Tầng 2 (EMA50): *{tp.get('dca_zone2', '—')}*",
-            f"  🔵 Tầng 3 (BB Low): *{tp.get('dca_zone3', '—')}* _(mua mạnh nhất)_",
-            f"  📍 Giá hiện tại: {tp.get('dca_current_zone', '')}",
+            f"  🔵 Tầng 3 (BB Low): *{tp.get('dca_zone3', '—')}*",
+            f"  📍 {tp.get('dca_current_zone', '')}",
             f"  _{tp.get('dist_note', '')}_",
             f"",
         ]
 
-    # ── Hỗ trợ & kháng cự ──
+    # Hỗ trợ & kháng cự
     lines += [
-        f"📐 *HỖ TRỢ & KHÁNG CỰ:*",
-        f"  S1 *{fmt_price(tp.get('support_1'))}* → S2 *{fmt_price(tp.get('support_2'))}* → S3 *{fmt_price(tp.get('support_3'))}*",
-        f"  Kháng cự: *{fmt_price(tp.get('resistance'))}*",
+        f"📐 S1 *{fmt_price(tp.get('support_1'))}* S2 *{fmt_price(tp.get('support_2'))}* S3 *{fmt_price(tp.get('support_3'))}* | R *{fmt_price(tp.get('resistance'))}*",
         f"",
     ]
 
-    # ── Bảng 5 tín hiệu thoát ──
-    lines += [
-        f"{'─'*34}",
-        f"🚨 *TÍN HIỆU THOÁT DÀI HẠN ({reversal}/5):*",
-        f"  _{tp.get('exit_threshold', 'Thoát khi ≥3/5')}_",
-    ]
-    for signal_name, status in tp.get("reversal_detail", {}).items():
-        lines.append(f"  {status}  {signal_name}")
-    lines.append("")
+    # Tín hiệu thoát (chỉ hiện khi có cảnh báo)
+    if reversal >= 1:
+        lines += [
+            f"⚠️ *THOÁT ({reversal}/5 tín hiệu):*",
+        ]
+        for sig_name, status in tp.get("reversal_detail", {}).items():
+            if "XẤU" in status:
+                lines.append(f"  {status}  {sig_name}")
+        lines.append("")
 
-    # ── Kỹ thuật ──
+    # ── Block kỹ thuật daily ──
     lines += [
         f"{'━'*34}",
-        f"📈 *KỸ THUẬT: {score}/100* `{bar}`",
+        f"📈 *KỸ THUẬT DAILY: {score}/100* `{bar}`",
         f"",
         f"C1 EMA+MACD+Vol   [{d['combo1']['score']:3d}%] {d['combo1']['signal']}",
         f"C2 VWAP+OBV+BB    [{d['combo2']['score']:3d}%] {d['combo2']['signal']}",
@@ -242,22 +280,36 @@ def ask_claude(prompt: str) -> str:
         return f"❌ Claude API lỗi: {str(e)[:100]}"
 
 def claude_with_combo(symbol: str, d: dict) -> str:
-    tp = d.get("trade_plan", {})
+    tp  = d.get("trade_plan", {})
+    mtf = d.get("mtf", {})
+    cf  = d.get("confluence", {})
+
     reversal_lines = "\n".join(
         f"  {status}: {sig}" for sig, status in tp.get("reversal_detail", {}).items()
     )
+    cf_lines = "\n".join(
+        f"  {v}" for v in cf.get("signals", {}).values()
+    )
     prompt = (
         f"Phân tích dài hạn {symbol} ngày {d['date']}:\n"
-        f"- Giá: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n"
-        f"- Score: {d['total_score']}/100 | Quyết định: {tp.get('decision_vi','')}\n"
-        f"- Trạng thái giữ: {tp.get('hold_status','')}\n"
-        f"- SuperTrend: {d['supertrend']} | EMA9/20/50: {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f}\n"
+        f"- Giá: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n\n"
+        f"[MTF SCORE: {mtf.get('mtf_total',0)}/100]\n"
+        f"- Quyết định MTF: {mtf.get('decision_vi','')}\n"
+        f"- Monthly {mtf.get('monthly_score',0)}: {mtf.get('monthly_note','')}\n"
+        f"- Weekly  {mtf.get('weekly_score',0)}: {mtf.get('weekly_note','')}\n"
+        f"- Daily   {d['total_score']}: {tp.get('decision_vi','')}\n"
+        f"- DCA cho phép: {mtf.get('dca_note','')}\n"
+        f"{('- ⚠️ ' + mtf.get('monthly_warning','')) if mtf.get('monthly_warning') else ''}\n\n"
+        f"[CONFLUENCE: {cf.get('score',0)}/40 — {cf.get('level','')}]\n"
+        f"{cf_lines}\n\n"
+        f"[KỸ THUẬT DAILY]\n"
+        f"- ST: {d['supertrend']} | EMA9/20/50: {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f}\n"
         f"- RSI: {d['rsi14']:.1f} | MACD: {d['macd']:+.3f} | OBV: {d['obv_trend']} | CMF: {d['cmf20']:+.3f}\n"
-        f"- Vùng DCA: Tầng1={tp.get('dca_zone1','')} | Tầng2={tp.get('dca_zone2','')} | Tầng3={tp.get('dca_zone3','')}\n"
+        f"- Vùng DCA: {tp.get('dca_zone1','')} | {tp.get('dca_zone2','')} | {tp.get('dca_zone3','')}\n"
         f"- Tín hiệu thoát ({tp.get('reversal_count',0)}/5):\n{reversal_lines}\n\n"
-        f"Phân tích ngắn (4-5 câu) theo góc nhìn dài hạn: "
-        f"xác nhận quyết định hệ thống, vùng DCA tốt nhất hiện tại, "
-        f"và 1 rủi ro dài hạn cần theo dõi."
+        f"Phân tích 4-5 câu theo góc nhìn dài hạn: xác nhận quyết định MTF, "
+        f"đánh giá confluence hiện tại có đủ mạnh để DCA không, "
+        f"và 1 rủi ro dài hạn quan trọng nhất cần theo dõi."
     )
     return ask_claude(prompt)
 
