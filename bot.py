@@ -675,7 +675,11 @@ def handle_callback_query(cbq):
             set_state(chat_id, "pf_add_sym")
             send_message(chat_id,
                 "➕ *Thêm mã vào danh mục*\n\n"
-                "Nhập mã cổ phiếu:\n_(VD: HPG — mỗi lần thêm 1 mã để nhập giá vốn)_"
+                "Cú pháp: `MÃ GIÁVỐN KL` — nhập nhiều mã cách nhau bằng khoảng trắng\n\n"
+                "VD:\n"
+                "`HPG 27100 1000 FPT 100000 100`\n"
+                "`HPG 27100 1000` — 1 mã đầy đủ\n"
+                "`VCB` — không nhập giá vốn"
             )
 
         elif action == "remove_list":
@@ -774,57 +778,58 @@ def process_state_input(chat_id, text):
             send_message(chat_id, "❓ Mã không hợp lệ. VD: HPG, FPT, VCB")
         return True
 
-    # ── ADD SYMBOL: bước 1 — nhập tên mã ──
+    # ── ADD SYMBOL: nhập nhiều mã "MÃ GIÁVỐN KHỐILƯỢNG MÃ2 GIÁVỐN2 ..." ──
     if step == "pf_add_sym":
-        sym = text.strip().upper()
-        if not re.match(r'^[A-Z]{2,4}[0-9]?$', sym):
-            send_message(chat_id, "❓ Mã không hợp lệ. Nhập lại (VD: HPG):")
-            return True
-        set_state(chat_id, "pf_add_cost", {"sym": sym})
-        send_message(chat_id,
-            f"💰 Nhập *giá vốn {sym}* (đơn vị: đồng/CP)\n"
-            f"VD: `25500` hoặc `0` nếu không muốn nhập"
-        )
-        return True
+        tokens = text.strip().upper().split()
 
-    # ── ADD SYMBOL: bước 2 — nhập giá vốn ──
-    if step == "pf_add_cost":
-        sym = data.get("sym", "")
-        try:
-            cost = float(text.strip().replace(",", "").replace(".", ""))
-            if cost < 0: raise ValueError
-        except ValueError:
-            send_message(chat_id, "❓ Nhập số hợp lệ (VD: 25500 hoặc 0):")
-            return True
-        set_state(chat_id, "pf_add_qty", {"sym": sym, "cost": cost})
-        send_message(chat_id,
-            f"📦 Nhập *khối lượng {sym}* (số cổ phiếu)\n"
-            f"VD: `1000` hoặc `0` nếu không muốn nhập"
-        )
-        return True
+        # Parse thành list các (sym, cost, qty)
+        entries = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if re.match(r'^[A-Z]{2,4}[0-9]?$', tok):
+                sym  = tok
+                cost = 0
+                qty  = 0
+                # Token tiếp theo: giá vốn?
+                if i+1 < len(tokens):
+                    try:
+                        cost = float(tokens[i+1].replace(",", ""))
+                        if cost < 0: cost = 0
+                        i += 1
+                        # Token tiếp theo nữa: khối lượng?
+                        if i+1 < len(tokens):
+                            try:
+                                qty = int(tokens[i+1].replace(",", ""))
+                                if qty < 0: qty = 0
+                                i += 1
+                            except ValueError:
+                                pass
+                    except ValueError:
+                        pass
+                entries.append((sym, cost, qty))
+            i += 1
 
-    # ── ADD SYMBOL: bước 3 — nhập khối lượng & lưu ──
-    if step == "pf_add_qty":
-        sym  = data.get("sym", "")
-        cost = data.get("cost", 0)
-        try:
-            qty = int(text.strip().replace(",", ""))
-            if qty < 0: raise ValueError
-        except ValueError:
-            send_message(chat_id, "❓ Nhập số nguyên hợp lệ (VD: 1000 hoặc 0):")
+        if not entries:
+            send_message(chat_id,
+                "❓ Cú pháp: `MÃ GIÁVỐN KL MÃ2 GIÁVỐN2 KL2 ...`\n"
+                "VD: `HPG 27100 1000 FPT 100000 100`"
+            )
             return True
 
-        ok, msg = pf.add_symbol(chat_id, sym, cost_price=cost, qty=qty)
+        results = []
+        for sym, cost, qty in entries:
+            ok, msg = pf.add_symbol(chat_id, sym, cost_price=cost, qty=qty)
+            if ok:
+                action_txt = "cập nhật" if msg == "updated" else "thêm"
+                cost_txt   = f" | {pf.fmt_price(cost)}" if cost > 0 else ""
+                qty_txt    = f" | {qty:,}CP" if qty > 0 else ""
+                results.append(f"✅ {action_txt} *{sym}*{cost_txt}{qty_txt}")
+            else:
+                results.append(f"❌ *{sym}*: {msg}")
+
         clear_state(chat_id)
-        if ok:
-            action_txt = "Đã cập nhật" if msg == "updated" else "Đã thêm"
-            cost_txt   = f" | Giá vốn: *{pf.fmt_price(cost)}*" if cost > 0 else ""
-            qty_txt    = f" | KL: *{qty:,} CP*" if qty > 0 else ""
-            send_message(chat_id, f"✅ {action_txt} *{sym}*{cost_txt}{qty_txt}")
-        else:
-            send_message(chat_id, f"❌ {msg}")
-
-        # Hỏi có thêm mã nữa không
+        send_message(chat_id, "\n".join(results))
         send_keyboard(chat_id, "Tiếp tục?", [
             [("➕ Thêm mã khác", "pf:add"),
              ("📋 Xem danh mục", "pf:back")],
