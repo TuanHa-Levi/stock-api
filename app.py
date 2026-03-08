@@ -450,9 +450,13 @@ def calc_confluence(closes, highs, lows, opens, volumes, rsi_series, ema20, ema5
             rsi_higher  = curr_rsi   > prev_rsi_low   + 3     # RSI cao hơn ít nhất 3 điểm
             if price_lower and rsi_higher:
                 b_score = 10
-                b_note  = f"RSI Div: giá thấp hơn ({curr_price:,.2f}<{prev_price_low:,.2f}) nhưng RSI cao hơn ({curr_rsi:.0f}>{prev_rsi_low:.0f})"
+                p_curr = f"{curr_price*1000:,.0f}đ" if curr_price < 1000 else f"{curr_price:,.0f}đ"
+                p_prev = f"{prev_price_low*1000:,.0f}đ" if prev_price_low < 1000 else f"{prev_price_low:,.0f}đ"
+                b_note  = f"Giá thấp hơn ({p_curr}<{p_prev}) nhưng RSI cao hơn ({curr_rsi:.0f}>{prev_rsi_low:.0f}) 📈"
             else:
-                b_note = f"Không có divergence (giá: {curr_price:,.2f} vs {prev_price_low:,.2f}, RSI: {curr_rsi:.0f} vs {prev_rsi_low:.0f})"
+                p_curr = f"{curr_price*1000:,.0f}đ" if curr_price < 1000 else f"{curr_price:,.0f}đ"
+                p_prev = f"{prev_price_low*1000:,.0f}đ" if prev_price_low < 1000 else f"{prev_price_low:,.0f}đ"
+                b_note = f"Không có divergence — giá: {p_curr} vs đáy {p_prev}, RSI: {curr_rsi:.0f} vs {prev_rsi_low:.0f}"
     signals["B. RSI Bullish Divergence"] = f"{'✅' if b_score > 0 else '❌'} {b_note} (+{b_score}đ)"
     confluence_score += b_score
 
@@ -481,20 +485,20 @@ def calc_confluence(closes, highs, lows, opens, volumes, rsi_series, ema20, ema5
     try:
         df_vni = get_stock_data('VNINDEX', days=40)
         if df_vni is not None and len(df_vni) >= 20:
-            vni_closes = df_vni['close'].astype(float).tolist()
-            rs_stock   = (closes[-1] - closes[-20]) / closes[-20] if closes[-20] != 0 else 0
-            rs_vni     = (vni_closes[-1] - vni_closes[-20]) / vni_closes[-20] if vni_closes[-20] != 0 else 0
-            rs_ratio   = (rs_stock / rs_vni) if rs_vni != 0 else 1.0
-            if rs_ratio > 1.15:
+            vni_closes  = df_vni['close'].astype(float).tolist()
+            rs_stock_pct = (closes[-1] - closes[-20]) / closes[-20] * 100 if closes[-20] != 0 else 0
+            rs_vni_pct   = (vni_closes[-1] - vni_closes[-20]) / vni_closes[-20] * 100 if vni_closes[-20] != 0 else 0
+            outperform   = round(rs_stock_pct - rs_vni_pct, 1)
+            if outperform >= 5:
                 d_score = 10
-                d_note  = f"RS={rs_ratio:.2f} — mạnh hơn VNIndex {(rs_ratio-1)*100:.0f}% 🔥"
-            elif rs_ratio > 1.0:
+                d_note  = f"Vượt trội VNIndex +{outperform:.1f}% (20 ngày) 🔥"
+            elif outperform >= 0:
                 d_score = 5
-                d_note  = f"RS={rs_ratio:.2f} — nhỉnh hơn VNIndex"
-            elif rs_ratio > 0.85:
-                d_note  = f"RS={rs_ratio:.2f} — ngang thị trường"
+                d_note  = f"Nhỉnh hơn VNIndex +{outperform:.1f}% (20 ngày)"
+            elif outperform >= -5:
+                d_note  = f"Ngang thị trường ({outperform:+.1f}% vs VNIndex)"
             else:
-                d_note  = f"RS={rs_ratio:.2f} — yếu hơn VNIndex ⚠️"
+                d_note  = f"Yếu hơn VNIndex {outperform:.1f}% (20 ngày) ⚠️"
         else:
             d_note = "Không lấy được data VNINDEX"
     except Exception:
@@ -895,10 +899,23 @@ def run_combo_analysis(symbol):
         dca_current_zone = f"Trên vùng DCA ({gap_to_ema20:+.1f}% so EMA20) — chờ pullback"
 
     # ── 5. Vùng hỗ trợ & kháng cự động ──
-    support_1  = round(min(ema20, st_val if st_val else ema20), 2)
-    support_2  = round(ema50, 2)
-    support_3  = round(bb_lower, 2) if bb_lower else round(ema50 * 0.95, 2)
-    resistance = round(bb_upper, 2) if bb_upper else round(latest_close * 1.05, 2)
+    # Hỗ trợ = mức GIÁ DƯỚI giá hiện tại; kháng cự = mức TRÊN giá hiện tại
+    price = latest_close
+    candidates = sorted(set([
+        round(ema20, 2),
+        round(ema50, 2),
+        round(st_val, 2) if st_val else round(ema20 * 0.97, 2),
+        round(bb_lower, 2) if bb_lower else round(ema50 * 0.95, 2),
+        round(bb_upper, 2) if bb_upper else round(price * 1.05, 2),
+        round(bb_mid, 2)   if bb_mid   else round(price * 1.02, 2),
+    ]))
+    supports    = sorted([x for x in candidates if x < price * 0.999], reverse=True)  # gần nhất trước
+    resistances = sorted([x for x in candidates if x > price * 1.001])                # gần nhất trước
+
+    support_1   = supports[0]    if len(supports) > 0 else round(price * 0.95, 2)
+    support_2   = supports[1]    if len(supports) > 1 else round(price * 0.90, 2)
+    support_3   = supports[2]    if len(supports) > 2 else round(price * 0.85, 2)
+    resistance  = resistances[0] if len(resistances) > 0 else round(price * 1.05, 2)
 
     # ── 6. Ra quyết định dài hạn ──
     if trend_reversed:
