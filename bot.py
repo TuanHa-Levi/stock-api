@@ -3,32 +3,50 @@
 # bot.py — Telegram Stock Bot với Combo Analysis Engine
 # Tự động nhận diện mã cổ phiếu trong bất kỳ tin nhắn nào
 # ============================================================
-import os, re, time, logging, requests
+import os, re, json, time, logging, requests
 import anthropic
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config — đọc từ .env trên VPS, không hardcode ──
+# ── Config — đọc từ biến môi trường / .env ──
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 STOCK_API_URL  = os.environ.get("STOCK_API_URL", "http://localhost:5000")
 
+# Kiểm tra credentials bắt buộc khi khởi động
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Thieu TELEGRAM_TOKEN trong .env")
+if not CLAUDE_API_KEY:
+    raise RuntimeError("Thieu CLAUDE_API_KEY trong .env")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# Danh sách mã hợp lệ HOSE/HNX phổ biến (dùng để filter false positive)
+# Nếu không có trong list này nhưng match pattern → vẫn thử gọi API
 KNOWN_SYMBOLS = {
+    # Bluechip HOSE
     "VCB","BID","CTG","TCB","MBB","VPB","ACB","STB","MSB","HDB",
     "VIC","VHM","VRE","VNM","SAB","MSN","MWG","FPT","HPG","GAS",
-    "PLX","PVD","PVS","PVT","BSR","DCM","DPM","DGC",
+    "PLX","PVD","PVS","PVT","BSR","GAS","DCM","DPM","DGC",
     "GMD","HAH","VSC","DVP","PNJ","REE","CMG","VGI","ELC",
     "KBC","IDC","SZC","BCM","KDH","NVL","PDR","DXG","THD",
     "HHV","LCG","CII","VCI","HCM","SSI","VND","FTS","BSI",
+    # VN30
     "VHM","VNM","GAS","SAB","CTD","HSG","NKG","TVS",
+    # Mid-cap phổ biến
     "HAG","HNG","QNS","VCS","PPC","BWE","TDM","PHR",
     "TAL","PC1","EVF","VIB","LPB","OCB","BAB","NAB",
     "AAT","ANV","AST","BFC","BMP","BVH","CAV","CHP",
+    # Chỉ số
     "VNINDEX","VN30",
+}
+
+# Từ khóa lệnh đặc biệt
+COMMAND_KEYWORDS = {
+    "/start", "/help", "/vnindex", "/sectors", "/macro", "/news",
+    "/phan", "/khuyen", "/stock"
 }
 
 # ── Telegram helpers ──
@@ -68,113 +86,154 @@ def api_get(path, timeout=25):
         return {"error": str(e)}
 
 # ── Pattern nhận diện mã cổ phiếu ──
-PRICE_WORDS = re.compile(r'(giá|phân tích|mua|bán|check|xem|tra|combo|signal|tín hiệu|xu hướng|kỹ thuật)', re.IGNORECASE)
+STOCK_PATTERN = re.compile(r'\b([A-Z]{2,4}[0-9]?[A-Z]?)\b')
+PRICE_WORDS   = re.compile(r'(giá|phân tích|mua|bán|check|xem|tra|combo|signal|tín hiệu|xu hướng|kỹ thuật)', re.IGNORECASE)
 
 def extract_symbol(text: str):
+    """
+    Trích xuất mã cổ phiếu từ text.
+    Ưu tiên: known symbols → pattern match với context
+    """
     text_upper = text.upper()
     words = re.findall(r'\b[A-Z0-9]+\b', text_upper)
 
+    # Pass 1: tìm trong known symbols
     for w in words:
         if w in KNOWN_SYMBOLS and w not in {"VN30", "VNINDEX"}:
             return w
 
+    # Pass 2: pattern 2-4 ký tự viết hoa, không phải stopword
     STOPWORDS = {
         "BUY","SELL","RSI","EMA","SMA","OBV","CMF","MFI","ATR","BB",
         "OK","NO","YES","THE","AND","BUT","FOR","NOT","CAN","GET","SET",
-        "BOT","API","VPS","TG","AI","ML","KBS","HNX","HOSE","VN",
+        "BOT","API","VPS","TG","AI","ML","KBS","VCI","HNX","HOSE","VN",
         "TP","SL","RR","MA","KQ","NV","MUA","BAN","GIA","CO","CHO",
         "NEN","DU","KY","NAM","MOI","MACD","VWAP","ADX","USD","VND",
-        "TANG","GIAM","CAO","THAP","LOG"
+        "HA","HA","TAN","TANG","GIAM","CAO","THAP","LOG"
     }
     for w in words:
-        if (2 <= len(w) <= 4 and w.isalpha() and w not in STOPWORDS):
+        if (2 <= len(w) <= 4 and
+            w.isalpha() and
+            w not in STOPWORDS and
+            not w.isnumeric()):
+            # Thêm điều kiện: text có vẻ hỏi về cổ phiếu
             if PRICE_WORDS.search(text) or len(text.split()) <= 3:
                 return w
+
     return None
 
-# ── Format combo result ──
+# ── Format combo result thành Telegram message ──
+def fmt_price(p):
+    """KBS trả về nghìn đồng — nhân 1000 để hiển thị đúng"""
+    if p is None: return "—"
+    return f"{p*1000:,.0f}đ" if p < 1000 else f"{p:,.0f}đ"
+
 def format_combo_message(d: dict) -> str:
     sym     = d["symbol"]
     price   = d["price"]
     chg     = d["change"]
     chg_pct = d["change_pct"]
     date    = d["date"]
-    emoji   = d["emoji"]
-    action  = d["action"]
     score   = d["total_score"]
-    overall = d["overall"]
+    tp      = d.get("trade_plan", {})
 
     chg_arrow = "📈" if chg >= 0 else "📉"
     chg_sign  = "+" if chg >= 0 else ""
-    filled = int(score / 10)
-    bar = "█" * filled + "░" * (10 - filled)
+    filled    = int(score / 10)
+    bar       = "█" * filled + "░" * (10 - filled)
+    decision  = tp.get("decision", "")
+    reversal  = tp.get("reversal_count", 0)
 
     lines = [
-        f"{'─'*32}",
-        f"📊 *{sym}* — Combo Analysis",
-        f"{'─'*32}",
-        f"{chg_arrow} Giá: *{price:,.0f}đ* ({chg_sign}{chg_pct:.1f}%) | {date}",
-        f"📦 Vol: {d['volume']/1e6:.1f}M ({d['vol_ratio']:.1f}x TB)",
+        f"{'━'*34}",
+        f"📊 *{sym}* | {date}",
+        f"{chg_arrow} Giá: *{fmt_price(price)}* ({chg_sign}{chg_pct:.1f}%)",
+        f"📦 Vol: {d['volume']/1e6:.1f}M ({d['vol_ratio']:.1f}x TB20)",
+        f"{'━'*34}",
         f"",
-        f"━━━ ĐIỂM TỔNG HỢP ━━━",
-        f"{emoji} *{overall}* — Hành động: *{action}*",
-        f"Score: `{bar}` *{score}/100*",
+        f"🎯 *QUYẾT ĐỊNH DÀI HẠN*",
+        f"{tp.get('decision_vi', '—')}",
+        f"_{tp.get('decision_note', '')}_",
         f"",
-        f"━━━ 5 COMBO CHỈ BÁO ━━━",
+        f"➡️ {tp.get('action_detail', '')}",
+        f"",
+    ]
+
+    # ── Trạng thái nắm giữ ──
+    lines += [
+        f"{'─'*34}",
+        f"📌 *TRẠNG THÁI NẮM GIỮ:*",
+        f"  {tp.get('hold_status', '')}",
+        f"  _{tp.get('hold_reason', '')}_",
+        f"",
+    ]
+
+    # ── DCA zones (khi nên mua thêm) ──
+    if decision in ["MUA_MANH", "TICH_LUY", "NAM_GIU", "THEO_DOI"]:
+        lines += [
+            f"{'─'*34}",
+            f"💰 *VÙNG DCA — MUA THEO PULLBACK:*",
+            f"  🟢 Tầng 1 (EMA20): *{tp.get('dca_zone1', '—')}*",
+            f"  🟡 Tầng 2 (EMA50): *{tp.get('dca_zone2', '—')}*",
+            f"  🔵 Tầng 3 (BB Low): *{tp.get('dca_zone3', '—')}* _(mua mạnh nhất)_",
+            f"  📍 Giá hiện tại: {tp.get('dca_current_zone', '')}",
+            f"  _{tp.get('dist_note', '')}_",
+            f"",
+        ]
+
+    # ── Hỗ trợ & kháng cự ──
+    lines += [
+        f"📐 *HỖ TRỢ & KHÁNG CỰ:*",
+        f"  S1 *{fmt_price(tp.get('support_1'))}* → S2 *{fmt_price(tp.get('support_2'))}* → S3 *{fmt_price(tp.get('support_3'))}*",
+        f"  Kháng cự: *{fmt_price(tp.get('resistance'))}*",
+        f"",
+    ]
+
+    # ── Bảng 5 tín hiệu thoát ──
+    lines += [
+        f"{'─'*34}",
+        f"🚨 *TÍN HIỆU THOÁT DÀI HẠN ({reversal}/5):*",
+        f"  _{tp.get('exit_threshold', 'Thoát khi ≥3/5')}_",
+    ]
+    for signal_name, status in tp.get("reversal_detail", {}).items():
+        lines.append(f"  {status}  {signal_name}")
+    lines.append("")
+
+    # ── Kỹ thuật ──
+    lines += [
+        f"{'━'*34}",
+        f"📈 *KỸ THUẬT: {score}/100* `{bar}`",
+        f"",
         f"C1 EMA+MACD+Vol   [{d['combo1']['score']:3d}%] {d['combo1']['signal']}",
         f"C2 VWAP+OBV+BB    [{d['combo2']['score']:3d}%] {d['combo2']['signal']}",
         f"C3 ST+StochRSI    [{d['combo3']['score']:3d}%] {d['combo3']['signal']}",
         f"C4 MACD X+RSI+MFI [{d['combo4']['score']:3d}%] {d['combo4']['signal']}",
         f"C5 Trend Strength [{d['combo5']['score']:3d}%] {d['combo5']['signal']}",
         f"",
-        f"━━━ CHỈ BÁO KEY ━━━",
-        f"RSI(14):    *{d['rsi14']:.1f}* {'⚠️OB' if d['rsi14']>70 else ('💚OS' if d['rsi14']<30 else '✅')}",
-        f"MACD:       {d['macd']:+.3f} | Signal: {d['macd_signal']:.3f}",
-        f"  └ {d['macd_cross']}",
-        f"EMA:   9={d['ema9']:,.0f}  20={d['ema20']:,.0f}  50={d['ema50']:,.0f}",
-        f"SuperTrend: *{d['supertrend']}* @ {d['st_level']:,.0f}",
-        f"OBV Trend:  *{d['obv_trend']}*{'  📌DIV' if d['obv_div'] else ''}",
-        f"CMF(20):    {d['cmf20']:+.3f} {'✅' if d['cmf20']>0 else '❌'}",
-        f"MFI(14):    {d['mfi14']:.1f}",
-        f"Stoch RSI:  K={d['stoch_rsi_k']:.0f}",
-        f"BB:  U={d['bb_upper']:,.0f} | M={d['bb_mid']:,.0f} | L={d['bb_lower']:,.0f}",
-        f"  └ Vị trí: *{d['bb_pos']}*",
-        f"ATR(14): {d['atr14']:,.0f}đ  |  Đà 5 phiên: {d['mom5d_pct']:+.1f}%",
-        f"",
-        f"━━━ KẾ HOẠCH GIAO DỊCH ━━━",
+        f"RSI {d['rsi14']:.0f} | MACD {d['macd']:+.3f} | ST: *{d['supertrend']}*",
+        f"EMA9/20/50: {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f}",
+        f"OBV: *{d['obv_trend']}* | CMF: {d['cmf20']:+.3f} | MFI: {d['mfi14']:.0f}",
+        f"Dòng tiền: *{tp.get('money_flow','—')}* | Trend: *{tp.get('trend_quality','—')}*",
     ]
 
-    if score >= 45:
-        lines += [
-            f"🎯 Entry:  *{d['entry']:,.0f}đ*",
-            f"🛑 Stop:   *{d['sl']:,.0f}đ* ({d['sl_pct']:+.1f}%)",
-            f"✅ TP1:    *{d['tp1']:,.0f}đ* ({d['tp1_pct']:+.1f}%)",
-            f"✅ TP2:    *{d['tp2']:,.0f}đ* ({d['tp2_pct']:+.1f}%)",
-            f"⚖️ R:R =   1 : {d['rr_ratio']}",
-        ]
-    else:
-        lines += [
-            f"⚠️ Score thấp — *không khuyến nghị* vào lệnh",
-            f"   Đợi tín hiệu rõ hơn hoặc xem ngành khác",
-        ]
-
-    lines += [
-        f"",
-        f"⚡ *Lưu ý:* Tham khảo thêm. Không phải tư vấn đầu tư.",
-    ]
     return "\n".join(lines)
 
-# ── Claude AI ──
+
+# ── Claude AI — Long-term Investment Assistant ──
 def ask_claude(prompt: str) -> str:
     try:
         client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         msg = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1000,
+            max_tokens=800,
             system=(
-                "Bạn là chuyên gia phân tích chứng khoán Việt Nam với 15 năm kinh nghiệm. "
-                "Trả lời ngắn gọn, súc tích, thực tế. Dùng tiếng Việt. "
-                "Khi phân tích cổ phiếu, luôn đề cập: xu hướng, dòng tiền, rủi ro, hành động cụ thể."
+                "Bạn là chuyên gia đầu tư dài hạn chứng khoán Việt Nam. "
+                "Nhà đầu tư nắm giữ nhiều tháng đến nhiều năm, không giao dịch ngắn hạn. "
+                "KHÔNG đề cập ATR, cắt lỗ theo giá cố định, hay chốt lời ngắn hạn. "
+                "Tập trung vào: xu hướng dài hạn, sức mạnh chỉ báo, dòng tiền tổ chức, "
+                "vùng DCA theo EMA, và khi nào thoát dựa trên đảo chiều chỉ báo. "
+                "Ra quyết định rõ: MUA THÊM / NẮM GIỮ / THOÁT. "
+                "Dùng tiếng Việt. Ngắn gọn, thực tế, không dài dòng."
             ),
             messages=[{"role": "user", "content": prompt}]
         )
@@ -182,24 +241,26 @@ def ask_claude(prompt: str) -> str:
     except Exception as e:
         return f"❌ Claude API lỗi: {str(e)[:100]}"
 
-def claude_with_combo(symbol: str, combo_data: dict) -> str:
-    summary = (
-        f"Cổ phiếu {symbol}, giá {combo_data['price']:,.0f}đ, "
-        f"thay đổi {combo_data['change_pct']:+.1f}%, "
-        f"RSI={combo_data['rsi14']:.1f}, MACD={combo_data['macd']:+.3f}, "
-        f"SuperTrend={combo_data['supertrend']}, OBV={combo_data['obv_trend']}, "
-        f"CMF={combo_data['cmf20']:+.3f}, Score={combo_data['total_score']}/100, "
-        f"Tín hiệu={combo_data['overall']}."
+def claude_with_combo(symbol: str, d: dict) -> str:
+    tp = d.get("trade_plan", {})
+    reversal_lines = "\n".join(
+        f"  {status}: {sig}" for sig, status in tp.get("reversal_detail", {}).items()
     )
     prompt = (
-        f"Dữ liệu kỹ thuật {symbol}: {summary}\n\n"
-        f"Phân tích ngắn (5-7 câu): "
-        f"1) Xu hướng hiện tại, "
-        f"2) Dòng tiền đang làm gì, "
-        f"3) Rủi ro chính, "
-        f"4) Hành động nên làm với lý do cụ thể."
+        f"Phân tích dài hạn {symbol} ngày {d['date']}:\n"
+        f"- Giá: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n"
+        f"- Score: {d['total_score']}/100 | Quyết định: {tp.get('decision_vi','')}\n"
+        f"- Trạng thái giữ: {tp.get('hold_status','')}\n"
+        f"- SuperTrend: {d['supertrend']} | EMA9/20/50: {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f}\n"
+        f"- RSI: {d['rsi14']:.1f} | MACD: {d['macd']:+.3f} | OBV: {d['obv_trend']} | CMF: {d['cmf20']:+.3f}\n"
+        f"- Vùng DCA: Tầng1={tp.get('dca_zone1','')} | Tầng2={tp.get('dca_zone2','')} | Tầng3={tp.get('dca_zone3','')}\n"
+        f"- Tín hiệu thoát ({tp.get('reversal_count',0)}/5):\n{reversal_lines}\n\n"
+        f"Phân tích ngắn (4-5 câu) theo góc nhìn dài hạn: "
+        f"xác nhận quyết định hệ thống, vùng DCA tốt nhất hiện tại, "
+        f"và 1 rủi ro dài hạn cần theo dõi."
     )
     return ask_claude(prompt)
+
 
 # ── Handlers ──
 def handle_help(chat_id):
@@ -235,7 +296,7 @@ def handle_vnindex(chat_id):
     msg = (
         f"{arrow} *VN-Index*\n"
         f"Điểm: *{d['close']:,.2f}*\n"
-        f"Thay đổi: *{sign}{d.get('change_pct',0):.2f}%* ({sign}{d.get('change',0):.2f} điểm)\n"
+        f"Thay đổi: *{sign}{d.get('change_pct', 0):.2f}%* ({sign}{d.get('change',0):.2f} điểm)\n"
         f"Open: {d.get('open',0):,.2f}\n"
         f"Ngày: {d.get('date','')}"
     )
@@ -250,45 +311,55 @@ def handle_sectors(chat_id):
     lines = ["📊 *Dòng tiền ngành hôm nay:*\n"]
     for s in d.get("sectors", []):
         sig_emoji = {"DONG TIEN VAO": "🟢", "DONG TIEN RA": "🔴"}.get(s["signal"], "⚪")
-        pct  = s['avg_change_pct']
+        pct = s['avg_change_pct']
         sign = "+" if pct >= 0 else ""
         lines.append(f"{sig_emoji} *{s['sector']}*: {sign}{pct:.1f}%")
     lines.append(f"\n_Cập nhật: {d.get('updated_at','')}_")
     send_message(chat_id, "\n".join(lines))
 
 def handle_stock_combo(chat_id, symbol: str):
+    """Handler chính — phân tích đầy đủ 5 combo"""
     send_typing(chat_id)
     send_message(chat_id, f"⏳ Đang phân tích *{symbol}* với 5 Combo chỉ báo...\n_(mất 5-10 giây)_")
 
     data = api_get(f"/combo/{symbol}", timeout=45)
     if "error" in data:
+        # Fallback sang /stock nếu không đủ data
         fallback = api_get(f"/stock/{symbol}", timeout=20)
         if "error" in fallback:
             send_message(chat_id, f"❌ Không tìm thấy mã *{symbol}*. Vui lòng kiểm tra lại.")
             return
-        send_message(chat_id,
+        msg = (
             f"⚠️ *{symbol}* — Dữ liệu cơ bản\n"
             f"Giá: *{fallback.get('close',0):,.0f}đ* ({fallback.get('change_pct',0):+.1f}%)\n"
             f"RSI(14): {fallback.get('rsi_14',50):.1f}\n"
             f"_(Không đủ dữ liệu lịch sử để chạy Combo Analysis)_"
         )
+        send_message(chat_id, msg)
         return
 
-    send_message(chat_id, format_combo_message(data))
+    # Gửi bảng combo
+    combo_msg = format_combo_message(data)
+    send_message(chat_id, combo_msg)
 
+    # Nếu score >= 45, thêm Claude insight
     if data.get("total_score", 0) >= 40:
         time.sleep(1)
         send_typing(chat_id)
-        send_message(chat_id, f"🧠 *Claude AI nhận định:*\n\n{claude_with_combo(symbol, data)}")
+        ai_insight = claude_with_combo(symbol, data)
+        send_message(chat_id, f"🧠 *Claude AI nhận định:*\n\n{ai_insight}")
 
 def handle_free_chat(chat_id, text: str):
+    """Xử lý chat tự do — hỏi Claude"""
     send_typing(chat_id)
-    send_message(chat_id, ask_claude(text))
+    response = ask_claude(text)
+    send_message(chat_id, response)
 
 # ── Main dispatcher ──
 def process_message(msg):
-    chat_id    = str(msg["chat"]["id"])
-    text       = msg.get("text", "").strip()
+    chat_id = str(msg["chat"]["id"])
+    text    = msg.get("text", "").strip()
+
     if not text:
         return
 
@@ -296,14 +367,18 @@ def process_message(msg):
     text_lower = text.lower()
     text_upper = text.upper()
 
-    if text_lower in ["/start", "/help", "help"]:
-        handle_help(chat_id); return
+    # ── Lệnh cụ thể ──
+    if text_lower in ["/start", "/help", "help", "giup", "huong dan"]:
+        handle_help(chat_id)
+        return
 
-    if text_lower in ["/vnindex", "vnindex"]:
-        handle_vnindex(chat_id); return
+    if text_lower == "/vnindex" or text_lower == "vnindex":
+        handle_vnindex(chat_id)
+        return
 
-    if text_lower in ["/sectors", "sectors", "nganh"]:
-        handle_sectors(chat_id); return
+    if text_lower in ["/sectors", "sectors", "nganh", "dong tien nganh"]:
+        handle_sectors(chat_id)
+        return
 
     if text_lower.startswith("/macro") or text_lower == "macro":
         send_typing(chat_id)
@@ -326,53 +401,61 @@ def process_message(msg):
             send_message(chat_id, "❌ Không lấy được tin tức")
         return
 
-    # Auto-detect mã 1-2 từ
+    # ── Auto-detect mã cổ phiếu ──
+    # Trường hợp 1: Nhắn đúng mã (1-2 từ viết hoa)
     words = text.split()
     if 1 <= len(words) <= 2:
         candidate = words[0].upper()
-        if re.match(r'^[A-Z]{2,4}$', candidate):
-            if candidate in KNOWN_SYMBOLS or len(candidate) == 3:
-                if candidate not in {"NO","OK","BN","TK","TP","SL","GD","KQ","VN"}:
-                    handle_stock_combo(chat_id, candidate); return
+        if re.match(r'^[A-Z]{2,4}[0-9]?[A-Z]?$', candidate):
+            if candidate in KNOWN_SYMBOLS or len(candidate) in [2,3]:
+                if candidate not in {"NO", "OK", "BN", "TK", "TP", "SL", "GD", "KQ"}:
+                    handle_stock_combo(chat_id, candidate)
+                    return
 
-    # Extract từ câu dài
+    # Trường hợp 2: Extract từ câu dài
     symbol = extract_symbol(text)
-    if symbol and symbol not in {"VN","OK","NO"}:
-        if not any(text_lower.startswith(k) for k in ["/phan","khuyen"]):
-            handle_stock_combo(chat_id, symbol); return
+    if symbol and symbol not in {"VN", "OK", "NO", "THE"}:
+        # Double-check: không phải lệnh thông thường
+        if not any(text_lower.startswith(cmd) for cmd in ["/phan", "/khuyen", "khuyen nghi"]):
+            handle_stock_combo(chat_id, symbol)
+            return
 
-    # /phan tich SYMBOL
-    m = re.search(r'(?:phan tich|phân tích|analyze|check)\s+([A-Z]{2,4})', text_upper)
-    if m:
-        handle_stock_combo(chat_id, m.group(1)); return
-
-    # Khuyến nghị
-    if any(k in text_lower for k in ["khuyen nghi","khuyến nghị","nen mua gi","nên mua gì"]):
-        send_typing(chat_id)
-        send_message(chat_id, f"💡 *Gợi ý đầu tư:*\n\n{ask_claude(text)}")
+    # Trường hợp 3: /phan tich hoặc phan tich [SYMBOL]
+    phan_match = re.search(r'(?:phan tich|phân tích|analyze|check)\s+([A-Z]{2,4})', text_upper)
+    if phan_match:
+        handle_stock_combo(chat_id, phan_match.group(1))
         return
 
-    # Chat tự do
+    # Trường hợp 4: khuyen nghi / khuyến nghị
+    if any(kw in text_lower for kw in ["khuyen nghi", "khuyến nghị", "nen mua gi", "nên mua gì", "co phieu tot"]):
+        send_typing(chat_id)
+        prompt = (
+            f"Câu hỏi từ nhà đầu tư: {text}\n\n"
+            "Hãy trả lời ngắn gọn và thực tế về thị trường chứng khoán Việt Nam hiện tại, "
+            "đề xuất 2-3 cổ phiếu đáng chú ý với lý do cụ thể."
+        )
+        response = ask_claude(prompt)
+        send_message(chat_id, f"💡 *Gợi ý đầu tư:*\n\n{response}")
+        return
+
+    # Trường hợp 5: Chat tự do → Claude trả lời
     handle_free_chat(chat_id, text)
 
 # ── Bot loop ──
 def main():
     log.info("🤖 Stock Bot khởi động — Combo Engine v2")
 
-    if not TELEGRAM_TOKEN:
-        log.error("❌ TELEGRAM_TOKEN chưa set trong .env"); return
-    if not CLAUDE_API_KEY:
-        log.error("❌ CLAUDE_API_KEY chưa set trong .env"); return
-
+    # Xóa webhook cũ
     try:
-        requests.post(f"{TELEGRAM_API}/deleteWebhook", timeout=10)
+        r = requests.post(f"{TELEGRAM_API}/deleteWebhook", timeout=10)
+        log.info(f"Webhook deleted: {r.json()}")
     except: pass
 
     send_message(CHAT_ID,
         "🤖 *Bot đã khởi động lại!*\n\n"
         "Chat bất kỳ mã CK để phân tích:\n"
         "`PVT` `FPT` `MBB` `TCB` ...\n\n"
-        "Gõ /help để xem hướng dẫn"
+        "Gõ /help để xem hướng dẫn đầy đủ"
     )
 
     offset = None
@@ -388,6 +471,7 @@ def main():
                     except Exception as e:
                         log.error(f"process_message error: {e}")
         except KeyboardInterrupt:
+            log.info("Bot stopped")
             break
         except Exception as e:
             log.error(f"Main loop error: {e}")
