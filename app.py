@@ -19,6 +19,7 @@ from vnstock import Quote
 import requests
 from datetime import datetime, timedelta
 import math
+import pandas as pd
 
 app = Flask(__name__)
 
@@ -262,7 +263,7 @@ def calc_mfi(highs, lows, closes, volumes, period=14):
     mfr = pos_mf / neg_mf
     return round(100 - (100 / (1 + mfr)), 2)
 
-def get_stock_data(symbol, days=80):
+def get_stock_data(symbol, days=400):
     """Pull data từ KBS — source hoạt động trên mọi cloud server"""
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -276,12 +277,356 @@ def get_stock_data(symbol, days=80):
         return None
 
 # ══════════════════════════════════════════════════════════════
+# MTF HELPERS — Resample & Score từng khung thời gian
+# ══════════════════════════════════════════════════════════════
+
+def resample_ohlcv(df_daily, rule='W-FRI'):
+    """Resample daily OHLCV → Weekly hoặc Monthly
+    rule: 'W-FRI' = weekly (kết thúc thứ 6), 'ME' = monthly
+    """
+    try:
+        df = df_daily.copy()
+        df['time'] = pd.to_datetime(df['time'])
+        df = df.set_index('time')
+        df_rs = df.resample(rule).agg({
+            'open':   'first',
+            'high':   'max',
+            'low':    'min',
+            'close':  'last',
+            'volume': 'sum',
+        }).dropna()
+        df_rs = df_rs.reset_index()
+        return df_rs
+    except Exception as e:
+        return None
+
+def calc_tf_score(closes, highs, lows, volumes, tf_name='weekly'):
+    """Tính score 0-100 cho một khung thời gian (weekly hoặc monthly)
+    Weekly : 7 chỉ báo — EMA9/20, Price>EMA9, ST, MACD, RSI, OBV, Vol
+    Monthly: 6 chỉ báo — EMA9/12, Price>EMA9, MACD, RSI, OBV, Vol
+    """
+    n = len(closes)
+    if tf_name == 'monthly' and n < 6:
+        return 0, "Không đủ data monthly", {}
+    if tf_name == 'weekly' and n < 10:
+        return 0, "Không đủ data weekly", {}
+
+    score = 0
+    details = {}
+
+    # EMA periods tùy khung
+    if tf_name == 'monthly':
+        p_fast, p_slow = 9, 12
+    else:
+        p_fast, p_slow = 9, 20
+
+    ema_fast_s = ema(closes, p_fast)
+    ema_slow_s = ema(closes, p_slow)
+    ef = next((x for x in reversed(ema_fast_s) if x is not None), closes[-1])
+    es = next((x for x in reversed(ema_slow_s) if x is not None), closes[-1])
+    latest = closes[-1]
+
+    # MACD
+    ml, sl_m, hist_m = calc_macd(closes, 6, 13, 5) if tf_name == 'monthly' else calc_macd(closes, 12, 26, 9)
+    macd_v  = next((x for x in reversed(ml)    if x is not None), 0)
+    hist_v  = next((x for x in reversed(hist_m) if x is not None), 0)
+
+    # RSI
+    rsi_v = calc_rsi(closes, 14)
+
+    # OBV — tăng trong 3 nến gần nhất
+    obv_s = calc_obv(closes, volumes)
+    obv_up = obv_s[-1] > obv_s[-4] if len(obv_s) >= 4 else False
+
+    # Volume vs TB
+    if tf_name == 'monthly':
+        vol_avg_n = 6
+    else:
+        vol_avg_n = 10
+    vol_avg = sum(volumes[-vol_avg_n:]) / min(len(volumes), vol_avg_n)
+    vol_surge = volumes[-1] > vol_avg
+
+    if tf_name == 'monthly':
+        # ─── Monthly Score (100đ) ───
+        c1 = ef > es
+        c2 = latest > ef
+        c3 = macd_v > 0
+        c4 = 40 <= rsi_v <= 75
+        c5 = bool(obv_up)
+        c6 = bool(vol_surge)
+        weights = [(c1,20),(c2,15),(c3,20),(c4,15),(c5,15),(c6,15)]
+        score = sum(w for c,w in weights if c)
+        details = {
+            f"EMA9M({ef:,.2f})>EMA12M({es:,.2f})":   ("✅" if c1 else "❌"),
+            f"Giá({latest:,.2f})>EMA9M":              ("✅" if c2 else "❌"),
+            "MACD Monthly dương":                      ("✅" if c3 else "❌"),
+            f"RSI Monthly {rsi_v:.0f} (40–75)":        ("✅" if c4 else "❌"),
+            "OBV Monthly tăng 3 kỳ":                   ("✅" if c5 else "❌"),
+            f"Vol tháng > TB{vol_avg_n} tháng":         ("✅" if c6 else "❌"),
+        }
+        note = f"EMA {'✅' if c1 else '❌'} | MACD {'✅' if c3 else '❌'} | RSI {rsi_v:.0f} | OBV {'✅' if c5 else '❌'}"
+    else:
+        # ─── Weekly Score (100đ) ───
+        # SuperTrend weekly
+        st_dir_w, _ = calc_supertrend(highs, lows, closes, 10, 3.0)
+        c1 = ef > es
+        c2 = latest > ef
+        c3 = st_dir_w == "BULL"
+        c4 = macd_v > 0
+        c5 = 40 <= rsi_v <= 72
+        c6 = bool(obv_up)
+        c7 = bool(vol_surge)
+        weights = [(c1,20),(c2,15),(c3,15),(c4,15),(c5,15),(c6,10),(c7,10)]
+        score = sum(w for c,w in weights if c)
+        details = {
+            f"EMA9W({ef:,.2f})>EMA20W({es:,.2f})":    ("✅" if c1 else "❌"),
+            f"Giá({latest:,.2f})>EMA9W":               ("✅" if c2 else "❌"),
+            "SuperTrend Weekly BULL":                   ("✅" if c3 else "❌"),
+            "MACD Weekly dương":                        ("✅" if c4 else "❌"),
+            f"RSI Weekly {rsi_v:.0f} (40–72)":          ("✅" if c5 else "❌"),
+            "OBV Weekly tăng":                          ("✅" if c6 else "❌"),
+            f"Vol tuần > TB{vol_avg_n} tuần":            ("✅" if c7 else "❌"),
+        }
+        note = f"EMA {'✅' if c1 else '❌'} | ST {'✅' if c3 else '❌'} | RSI {rsi_v:.0f} | OBV {'✅' if c6 else '❌'}"
+
+    return score, note, details
+
+def calc_confluence(closes, highs, lows, opens, volumes, rsi_series, ema20, ema50, symbol):
+    """Confluence Layer — A+B+C+D (tổng 40đ)
+    A: Mẫu nến đảo chiều tại vùng hỗ trợ  (+10)
+    B: RSI Bullish Divergence               (+10)
+    C: Volume Dry-up trong pullback         (+10)
+    D: Relative Strength vs VNINDEX         (+10)
+    """
+    n = len(closes)
+    confluence_score = 0
+    signals = {}
+
+    # ── A: Mẫu nến đảo chiều tại/gần vùng hỗ trợ ──
+    at_support = closes[-1] <= ema20 * 1.02  # trong vòng 2% trên EMA20
+    a_score = 0
+    a_note  = ""
+    if n >= 2:
+        o, h, c, l = opens[-1], highs[-1], closes[-1], lows[-1]
+        po, ph, pc, pl = opens[-2], highs[-2], closes[-2], lows[-2]
+        body        = abs(c - o)
+        lower_shadow = c - l if c > o else o - l
+        upper_shadow = h - c if c > o else h - o
+        full_range   = h - l if h != l else 0.0001
+
+        # Hammer: thân nhỏ, bóng dưới dài ≥ 2×thân, bóng trên ngắn
+        is_hammer = (body > 0 and lower_shadow >= 2 * body
+                     and upper_shadow <= body * 0.5
+                     and c > o and at_support)
+        # Bullish Engulfing: nến đỏ hôm qua, nến xanh hôm nay bao trùm
+        is_engulfing = (pc < po and c > o and c >= po and o <= pc)
+        # Doji tại support: thân rất nhỏ so với range
+        is_doji_support = (body / full_range < 0.1 and at_support)
+
+        if is_hammer:
+            a_score = 10; a_note = "Hammer tại vùng hỗ trợ 🔨"
+        elif is_engulfing:
+            a_score = 10; a_note = "Bullish Engulfing 📈"
+        elif is_doji_support:
+            a_score = 6;  a_note = "Doji tại hỗ trợ (tín hiệu yếu hơn)"
+        else:
+            a_note = "Không có mẫu nến đảo chiều"
+    signals["A. Mẫu nến đảo chiều"] = f"{'✅' if a_score > 0 else '❌'} {a_note} (+{a_score}đ)"
+    confluence_score += a_score
+
+    # ── B: RSI Bullish Divergence ──
+    b_score = 0; b_note = ""
+    valid_rsi = [x for x in rsi_series if x is not None]
+    lookback  = min(20, len(closes)-1, len(valid_rsi)-1)
+    if lookback >= 5:
+        price_window = closes[-lookback-1:-1]
+        rsi_window   = valid_rsi[-lookback-1:-1]
+        if len(price_window) > 0 and len(rsi_window) > 0:
+            prev_price_low = min(price_window)
+            prev_rsi_low   = min(rsi_window)
+            curr_price     = closes[-1]
+            curr_rsi       = valid_rsi[-1]
+            price_lower = curr_price < prev_price_low * 0.99  # giá thấp hơn ít nhất 1%
+            rsi_higher  = curr_rsi   > prev_rsi_low   + 3     # RSI cao hơn ít nhất 3 điểm
+            if price_lower and rsi_higher:
+                b_score = 10
+                b_note  = f"RSI Div: giá thấp hơn ({curr_price:,.2f}<{prev_price_low:,.2f}) nhưng RSI cao hơn ({curr_rsi:.0f}>{prev_rsi_low:.0f})"
+            else:
+                b_note = f"Không có divergence (giá: {curr_price:,.2f} vs {prev_price_low:,.2f}, RSI: {curr_rsi:.0f} vs {prev_rsi_low:.0f})"
+    signals["B. RSI Bullish Divergence"] = f"{'✅' if b_score > 0 else '❌'} {b_note} (+{b_score}đ)"
+    confluence_score += b_score
+
+    # ── C: Volume Dry-up — áp lực bán yếu trong pullback ──
+    c_score = 0; c_note = ""
+    if n >= 6:
+        # Lấy 5 nến gần nhất có giá giảm
+        pullback_vols = [volumes[i] for i in range(-5, 0) if closes[i] < closes[i-1]]
+        if len(pullback_vols) >= 3:
+            # Volume nến cuối pullback < 70% volume đầu pullback
+            if pullback_vols[-1] < pullback_vols[0] * 0.70:
+                c_score = 10
+                c_note  = f"Vol giảm dần trong pullback ({pullback_vols[-1]/1e6:.1f}M < {pullback_vols[0]/1e6:.1f}M) — bán yếu"
+            elif pullback_vols[-1] < pullback_vols[0] * 0.85:
+                c_score = 5
+                c_note  = "Vol giảm nhẹ trong pullback"
+            else:
+                c_note  = "Vol không giảm — áp lực bán còn"
+        else:
+            c_note = "Không đủ nến pullback để đánh giá"
+    signals["C. Volume Dry-up"] = f"{'✅' if c_score > 0 else '❌'} {c_note} (+{c_score}đ)"
+    confluence_score += c_score
+
+    # ── D: Relative Strength vs VNINDEX ──
+    d_score = 0; d_note = ""
+    try:
+        df_vni = get_stock_data('VNINDEX', days=40)
+        if df_vni is not None and len(df_vni) >= 20:
+            vni_closes = df_vni['close'].astype(float).tolist()
+            rs_stock   = (closes[-1] - closes[-20]) / closes[-20] if closes[-20] != 0 else 0
+            rs_vni     = (vni_closes[-1] - vni_closes[-20]) / vni_closes[-20] if vni_closes[-20] != 0 else 0
+            rs_ratio   = (rs_stock / rs_vni) if rs_vni != 0 else 1.0
+            if rs_ratio > 1.15:
+                d_score = 10
+                d_note  = f"RS={rs_ratio:.2f} — mạnh hơn VNIndex {(rs_ratio-1)*100:.0f}% 🔥"
+            elif rs_ratio > 1.0:
+                d_score = 5
+                d_note  = f"RS={rs_ratio:.2f} — nhỉnh hơn VNIndex"
+            elif rs_ratio > 0.85:
+                d_note  = f"RS={rs_ratio:.2f} — ngang thị trường"
+            else:
+                d_note  = f"RS={rs_ratio:.2f} — yếu hơn VNIndex ⚠️"
+        else:
+            d_note = "Không lấy được data VNINDEX"
+    except Exception:
+        d_note = "Lỗi khi lấy VNINDEX"
+    signals["D. Sức mạnh vs VNINDEX"] = f"{'✅' if d_score > 0 else '❌'} {d_note} (+{d_score}đ)"
+    confluence_score += d_score
+
+    # ── Phân loại Confluence ──
+    if confluence_score >= 30:
+        cf_level = "RẤT MẠNH 🔥🔥"
+    elif confluence_score >= 20:
+        cf_level = "MẠNH 🔥"
+    elif confluence_score >= 10:
+        cf_level = "TRUNG BÌNH ⚡"
+    else:
+        cf_level = "YẾU ❄️"
+
+    return {
+        "score":      confluence_score,
+        "max_score":  40,
+        "level":      cf_level,
+        "signals":    signals,
+        "note":       f"Confluence {confluence_score}/40 — {cf_level}",
+    }
+
+def calc_mtf(df_daily, daily_score, symbol):
+    """MTF Score = Monthly×30% + Weekly×35% + Daily×35%
+    Fallback nếu monthly < 6 nến → Weekly×45% + Daily×55%
+    """
+    # ── Resample ──
+    df_w = resample_ohlcv(df_daily, 'W-FRI')
+    df_m = resample_ohlcv(df_daily, 'ME')
+
+    # ── Weekly score ──
+    w_score, w_note, w_detail = 0, "Không đủ data", {}
+    if df_w is not None and len(df_w) >= 10:
+        wc = df_w['close'].astype(float).tolist()
+        wh = df_w['high'].astype(float).tolist()
+        wl = df_w['low'].astype(float).tolist()
+        wv = df_w['volume'].astype(float).tolist()
+        w_score, w_note, w_detail = calc_tf_score(wc, wh, wl, wv, 'weekly')
+
+    # ── Monthly score ──
+    m_score, m_note, m_detail = 0, "Không đủ data", {}
+    fallback = True
+    if df_m is not None and len(df_m) >= 6:
+        mc = df_m['close'].astype(float).tolist()
+        mh = df_m['high'].astype(float).tolist()
+        ml = df_m['low'].astype(float).tolist()
+        mv = df_m['volume'].astype(float).tolist()
+        m_score, m_note, m_detail = calc_tf_score(mc, mh, ml, mv, 'monthly')
+        fallback = False
+
+    # ── Trọng số & MTF Total ──
+    if fallback:
+        mtf_total  = round(w_score * 0.45 + daily_score * 0.55)
+        weights_str = "Weekly 45% + Daily 55% (fallback — thiếu Monthly)"
+    else:
+        mtf_total  = round(m_score * 0.30 + w_score * 0.35 + daily_score * 0.35)
+        weights_str = "Monthly 30% + Weekly 35% + Daily 35%"
+
+    # ── Quyết định MTF ──
+    base_score   = mtf_total
+    monthly_weak = (not fallback) and (m_score < 35)
+    monthly_dead = (not fallback) and (m_score < 20)
+
+    def mtf_decision_from_score(s):
+        if s >= 75:   return "MUA_MANH",       "🟢🟢 MUA MẠNH",            ["tang1","tang2","tang3"]
+        elif s >= 60: return "TICH_LUY",        "🟢 TÍCH LŨY",              ["tang1","tang2"]
+        elif s >= 50: return "NAM_GIU",         "⚪ NẮM GIỮ",               ["tang3"]
+        elif s >= 40: return "THEO_DOI",        "🟡 THEO DÕI",              []
+        else:         return "CANH_BAO",        "🔴 CẢNH BÁO",              []
+
+    decision_key, decision_vi, dca_allowed = mtf_decision_from_score(base_score)
+
+    # Rule giảm 1 bậc nếu Monthly yếu
+    downgraded = False
+    if monthly_dead:
+        decision_key  = "CANH_BAO"
+        decision_vi   = "🔴 CẢNH BÁO — Monthly rất xấu"
+        dca_allowed   = []
+        downgraded    = True
+    elif monthly_weak and decision_key not in ["CANH_BAO", "THEO_DOI"]:
+        levels = ["MUA_MANH","TICH_LUY","NAM_GIU","THEO_DOI","CANH_BAO"]
+        idx = levels.index(decision_key)
+        decision_key, decision_vi, dca_allowed = mtf_decision_from_score(base_score - 15)
+        downgraded = True
+
+    # Cảnh báo Monthly
+    if monthly_dead:
+        monthly_warning = f"⛔ Monthly score {m_score}/100 — xu hướng lớn rất xấu, chặn DCA"
+    elif monthly_weak:
+        monthly_warning = f"⚠️ Monthly score {m_score}/100 — xu hướng lớn chưa xác nhận, giảm 1 bậc"
+    else:
+        monthly_warning = None
+
+    # DCA labels
+    dca_labels = {
+        "tang1": "Tầng 1 (EMA20)",
+        "tang2": "Tầng 2 (EMA50)",
+        "tang3": "Tầng 3 (BB Lower — oversold)"
+    }
+    dca_note = " | ".join(dca_labels[t] for t in dca_allowed) if dca_allowed else "Không DCA"
+
+    return {
+        "monthly_score":    m_score,
+        "weekly_score":     w_score,
+        "daily_score":      daily_score,
+        "mtf_total":        mtf_total,
+        "weights":          weights_str,
+        "fallback":         fallback,
+        "decision":         decision_key,
+        "decision_vi":      decision_vi,
+        "dca_allowed":      dca_allowed,
+        "dca_note":         dca_note,
+        "downgraded":       downgraded,
+        "monthly_warning":  monthly_warning,
+        "monthly_note":     m_note,
+        "weekly_note":      w_note,
+        "monthly_detail":   m_detail,
+        "weekly_detail":    w_detail,
+        "monthly_candles":  len(df_m) if df_m is not None else 0,
+        "weekly_candles":   len(df_w) if df_w is not None else 0,
+    }
+
+# ══════════════════════════════════════════════════════════════
 # COMBO ENGINE — Tính điểm và tín hiệu 5 combo
 # ══════════════════════════════════════════════════════════════
 
 def run_combo_analysis(symbol):
     symbol = symbol.upper()
-    df = get_stock_data(symbol, days=90)
+    df = get_stock_data(symbol, days=400)
     if df is None or len(df) < 30:
         return None, f"Không đủ dữ liệu cho {symbol}"
 
@@ -708,6 +1053,14 @@ def run_combo_analysis(symbol):
         "entry":       latest_close,
         "atr14":       atr14,
         "trade_plan":  trade_plan,
+        "mtf":         calc_mtf(df, total_score, symbol),
+        "confluence":  calc_confluence(
+                           closes, highs, lows,
+                           df['open'].astype(float).tolist(),
+                           volumes,
+                           calc_rsi_series(closes, 14),
+                           ema20, ema50, symbol
+                       ),
     }, None
 
 # ══════════════════════════════════════════════════════════════
