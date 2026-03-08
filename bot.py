@@ -606,8 +606,10 @@ def process_message(msg):
         return
 
     log.info(f"MSG [{chat_id}]: {text[:80]}")
+    import unicodedata
+    text       = unicodedata.normalize("NFC", text)
     text_lower = text.lower()
-    text_upper = text.upper()
+    text_upper = unicodedata.normalize("NFC", text.upper())
 
     # ── Lệnh cụ thể ──
     if text_lower in ["/start", "/help", "help", "giup", "huong dan"]:
