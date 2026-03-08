@@ -47,7 +47,7 @@ KNOWN_SYMBOLS = {
 # Từ khóa lệnh đặc biệt
 COMMAND_KEYWORDS = {
     "/start", "/help", "/vnindex", "/sectors", "/macro", "/news",
-    "/phan", "/khuyen", "/stock"
+    "/alert", "/summary", "/phan", "/khuyen", "/stock"
 }
 
 # ── Telegram helpers ──
@@ -290,10 +290,27 @@ def format_combo_message(d: dict) -> str:
     lines += [
         f"",
         # ── Confluence ──
-        f"🔍 *Confluence: {cf_score}/40 — {cf.get('level','')}*",
+        f"🔍 *Confluence: {cf_score}/45 — {cf.get('level','')}*",
     ]
     for sig_val in cf.get("signals", {}).values():
         lines.append(f"  {sig_val}")
+
+    # ── Kelly Sizing (v4.0) ──
+    ks = d.get("kelly_size", {})
+    kelly_tier = ks.get("tier", "NONE")
+    kelly_emoji = {"STRONG": "💰💰", "NORMAL": "💰", "WEAK": "⚠️", "NONE": "🚫"}.get(kelly_tier, "⚪")
+    if kelly_tier != "NONE":
+        lines += [
+            f"",
+            f"{'─'*34}",
+            f"{kelly_emoji} *Phân bổ vốn (Kelly)*: {ks.get('pct_per_dca','—')}/lần | Max {ks.get('max_position','—')}",
+            f"  _{ks.get('note','')}_ | {ks.get('allocation_40_35_25','') or ''}",
+        ]
+
+    # ── Dynamic Weight Note (v4.0) ──
+    w_note = d.get("weight_note", "")
+    if w_note:
+        lines.append(f"  ⚖️ _{w_note}_")
 
     lines += [
         f"",
@@ -436,37 +453,36 @@ def claude_with_combo(symbol: str, d: dict) -> str:
     )
     return ask_claude(prompt)
 
-    # Truyền đầy đủ giá tham chiếu để Claude output đúng mức giá
-    prompt = (
-        f"Phân tích dài hạn {symbol} ngày {d['date']}:\n"
-        f"- Giá hiện tại: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n"
-        f"- EMA9/20/50: {fmt_price(d['ema9'])}/{fmt_price(d['ema20'])}/{fmt_price(d['ema50'])}\n"
-        f"- BB Upper/Lower: {fmt_price(d.get('bb_upper'))}/{fmt_price(d.get('bb_lower'))}\n\n"
-        f"[MTF: {mtf.get('mtf_total',0)}/100 — {mtf.get('decision_vi','')}]\n"
-        f"- Monthly {mtf.get('monthly_score',0)}: {mtf.get('monthly_note','')}\n"
-        f"- Weekly  {mtf.get('weekly_score',0)}: {mtf.get('weekly_note','')}\n"
-        f"- Daily   {d['total_score']}: {tp.get('decision_vi','')}\n"
-        f"{('- ⚠️ ' + mtf.get('monthly_warning','')) if mtf.get('monthly_warning') else ''}\n\n"
-        f"[CONFLUENCE: {cf.get('score',0)}/40 — {cf.get('level','')}]\n"
-        f"{cf_lines}\n\n"
-        f"[KỸ THUẬT]\n"
-        f"- ST: {d['supertrend']} | RSI: {d['rsi14']:.1f} | MACD: {d['macd']:+.3f} | OBV: {d['obv_trend']}\n"
-        f"- Tín hiệu thoát ({tp.get('reversal_count',0)}/5):\n{reversal_lines}\n\n"
-        f"[VÙNG GIÁ THAM CHIẾU]\n"
-        f"- DCA Tầng 1 (EMA20): {tp.get('dca_zone1','')}\n"
-        f"- DCA Tầng 2 (EMA50): {tp.get('dca_zone2','')}\n"
-        f"- DCA Tầng 3 (BB Low): {tp.get('dca_zone3','')}\n"
-        f"- Hỗ trợ: {fmt_price(tp.get('support_1'))} / {fmt_price(tp.get('support_2'))} / {fmt_price(tp.get('support_3'))}\n"
-        f"- Kháng cự: {fmt_price(tp.get('resistance'))}\n\n"
-        f"Yêu cầu output CHÍNH XÁC theo format sau (không thêm bớt):\n"
-        f"Quyết định: [MUA THÊM 🟢 / NẮM GIỮ ⚪ / THOÁT 🔴]\n"
-        f"📌 Giá mua thêm (DCA): [vùng giá cụ thể từ dữ liệu trên]\n"
-        f"📌 Giá vào lệnh mới: [vùng giá cụ thể nếu chưa có vị thế]\n"
-        f"📌 Chốt lời một phần: [mức kháng cự gần nhất hoặc 'Chưa — tiếp tục giữ']\n"
-        f"📌 Thoát lệnh khi: [điều kiện chỉ báo cụ thể, KHÔNG dùng giá cố định]\n"
-        f"[1-2 câu nhận định ngắn gọn lý do và rủi ro chính]"
-    )
-    return ask_claude(prompt)
+
+# ── Alert integration ──
+ALERT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.py")
+
+def handle_alert_scan(chat_id, manual_chat_id=None):
+    """Kích hoạt alert scan từ Telegram /alert command."""
+    cid = manual_chat_id or chat_id
+    send_message(cid, "🔔 Đang quét danh mục để tìm tín hiệu mới...")
+    try:
+        result = subprocess.run(
+            ["python3", ALERT_SCRIPT, "--once", "--chat-id", str(cid)],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0 and result.stderr:
+            send_message(cid, f"⚠️ Alert scan lỗi: {result.stderr[-200:]}")
+    except subprocess.TimeoutExpired:
+        send_message(cid, "⏱️ Alert scan timeout (>5 phút)")
+    except Exception as e:
+        send_message(cid, f"❌ Không chạy được alert: {e}")
+
+def handle_alert_summary(chat_id):
+    """Gửi tóm tắt toàn bộ danh mục."""
+    send_message(chat_id, "📊 Đang tổng hợp danh mục...")
+    try:
+        subprocess.run(
+            ["python3", ALERT_SCRIPT, "--summary", "--chat-id", str(chat_id)],
+            capture_output=True, text=True, timeout=300
+        )
+    except Exception as e:
+        send_message(chat_id, f"❌ Lỗi: {e}")
 
 
 # ── Handlers ──
@@ -488,7 +504,14 @@ def handle_help(chat_id):
         "  C3: SuperTrend + Stoch RSI + CMF\n"
         "  C4: MACD Cross + RSI + MFI\n"
         "  C5: Multi-TF Trend Strength\n\n"
-        "⚡ Score ≥70 = Mua mạnh | 55-69 = Mua | <45 = Tránh"
+        "⚡ Score ≥70 = Mua mạnh | 55-69 = Mua | <45 = Tránh\n\n"
+        "🔔 *Alert v4.0:*\n"
+        "  `/alert`    — quét tín hiệu thay đổi\n"
+        "  `/summary`  — tóm tắt toàn danh mục\n\n"
+        "💼 *Danh mục (MVP2):*\n"
+        "  `thêm HPG FPT` — thêm vào watchlist\n"
+        "  `xóa HPG`      — xóa khỏi watchlist\n"
+        "  `danh mục`     — xem danh sách"
     )
     send_message(chat_id, msg)
 
@@ -598,6 +621,14 @@ def process_message(msg):
         handle_sectors(chat_id)
         return
 
+    if text_lower in ["/alert", "alert", "quet", "quét", "quet tin hieu", "quét tín hiệu"]:
+        threading.Thread(target=handle_alert_scan, args=(chat_id,), daemon=True).start()
+        return
+
+    if text_lower in ["/summary", "summary", "tom tat", "tóm tắt", "tong hop danh muc"]:
+        threading.Thread(target=handle_alert_summary, args=(chat_id,), daemon=True).start()
+        return
+
     if text_lower.startswith("/macro") or text_lower == "macro":
         send_typing(chat_id)
         d = api_get("/macro")
@@ -670,7 +701,7 @@ def main():
     except: pass
 
     send_message(CHAT_ID,
-        "🤖 *Bot đã khởi động lại!* (vnstock v3)\n\n"
+        "🤖 *Bot v4.0 khởi động!* (Dynamic Weights | Kelly | Alert)\n\n"
         "Chat bất kỳ mã CK để phân tích:\n"
         "`PVT` `FPT` `MBB` `TCB` ...\n\n"
         "Gõ /help để xem hướng dẫn đầy đủ"
