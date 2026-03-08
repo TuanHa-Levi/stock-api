@@ -128,6 +128,75 @@ def fmt_price(p):
     if p is None: return "—"
     return f"{p*1000:,.0f}đ" if p < 1000 else f"{p:,.0f}đ"
 
+def calc_master_decision(mtf: dict, tp: dict, cf: dict) -> tuple[str, str, str]:
+    """Tổng hợp MTF + Daily + Confluence → 1 quyết định MASTER duy nhất
+    Returns: (decision_vi, reason, action)
+    """
+    mtf_dec       = mtf.get("decision", "")
+    mtf_total     = mtf.get("mtf_total", 0)
+    daily_dec     = tp.get("decision", "")
+    reversal      = tp.get("reversal_count", 0)
+    cf_score      = cf.get("score", 0)
+    dca_allowed   = mtf.get("dca_allowed", [])
+    monthly_score = mtf.get("monthly_score", 0)
+
+    # ── Rule 1: Thoát cứng — không cần hỏi thêm ──
+    if daily_dec == "THOAT_LENH" or (reversal >= 3):
+        return (
+            "🔴🔴 THOÁT LỆNH",
+            f"Daily xác nhận đảo chiều {reversal}/5 tín hiệu",
+            "Giảm tỷ trọng mạnh hoặc thoát toàn bộ"
+        )
+
+    # ── Rule 2: Monthly rất xấu ──
+    if monthly_score < 20:
+        return (
+            "🔴 KHÔNG DCA — Monthly xấu",
+            f"Monthly {monthly_score}/100 — xu hướng lớn không ủng hộ",
+            "Giữ nguyên, không mua thêm, theo dõi chặt"
+        )
+
+    # ── Rule 3: MTF tốt + Confluence đủ → DCA ──
+    if mtf_total >= 60 and cf_score >= 20 and reversal <= 1:
+        dca_str = mtf.get("dca_note", "theo MTF")
+        return (
+            "🟢 DCA — Đủ xác nhận",
+            f"MTF {mtf_total}/100 tốt + Confluence {cf_score}/40 đủ mạnh",
+            f"DCA tại: {dca_str}"
+        )
+
+    # ── Rule 4: MTF tốt nhưng Confluence yếu → chờ ──
+    if mtf_total >= 60 and cf_score < 20 and reversal <= 1:
+        return (
+            "⚪ NẮM GIỮ — Chờ xác nhận",
+            f"MTF {mtf_total}/100 tốt nhưng Confluence {cf_score}/40 chưa đủ",
+            "Giữ nguyên — chờ Confluence ≥20 hoặc giá về vùng DCA tốt hơn"
+        )
+
+    # ── Rule 5: Daily cảnh báo (2 reversal) dù MTF tốt ──
+    if reversal == 2 and mtf_total >= 55:
+        return (
+            "🟡 THEO DÕI CHẶT — Rủi ro ngắn hạn",
+            f"Daily có {reversal}/5 tín hiệu xấu — MTF {mtf_total}/100 vẫn ổn",
+            "Không DCA thêm. Thoát nếu thêm 1 tín hiệu đảo chiều"
+        )
+
+    # ── Rule 6: MTF yếu ──
+    if mtf_total < 50:
+        return (
+            "🔴 CẢNH BÁO — MTF yếu",
+            f"MTF chỉ {mtf_total}/100 — xu hướng không đủ mạnh",
+            "Không DCA. Chờ MTF cải thiện trên 55"
+        )
+
+    # ── Default: NẮM GIỮ ──
+    return (
+        "⚪ NẮM GIỮ",
+        f"MTF {mtf_total}/100 — chưa đủ điều kiện DCA",
+        "Tiếp tục giữ, không hành động"
+    )
+
+
 def format_combo_message(d: dict) -> str:
     sym     = d["symbol"]
     price   = d["price"]
@@ -141,15 +210,18 @@ def format_combo_message(d: dict) -> str:
 
     chg_arrow = "📈" if chg >= 0 else "📉"
     chg_sign  = "+" if chg >= 0 else ""
-    filled    = int(score / 10)
-    bar       = "█" * filled + "░" * (10 - filled)
-    decision  = tp.get("decision", "")
     reversal  = tp.get("reversal_count", 0)
-
-    # MTF bar
     mtf_total = mtf.get("mtf_total", 0)
-    mtf_filled = int(mtf_total / 10)
-    mtf_bar    = "█" * mtf_filled + "░" * (10 - mtf_filled)
+    cf_score  = cf.get("score", 0)
+
+    # Progress bars
+    filled_mtf   = int(mtf_total / 10)
+    bar_mtf      = "█" * filled_mtf + "░" * (10 - filled_mtf)
+    filled_daily = int(score / 10)
+    bar_daily    = "█" * filled_daily + "░" * (10 - filled_daily)
+
+    # MASTER decision
+    master_vi, master_reason, master_action = calc_master_decision(mtf, tp, cf)
 
     lines = [
         f"{'━'*34}",
@@ -158,101 +230,67 @@ def format_combo_message(d: dict) -> str:
         f"📦 Vol: {d['volume']/1e6:.1f}M ({d['vol_ratio']:.1f}x TB20)",
         f"{'━'*34}",
         f"",
+        # ── MASTER DECISION — to nhất, rõ nhất ──
+        f"🏁 *QUYẾT ĐỊNH: {master_vi}*",
+        f"_{master_reason}_",
+        f"➡️ *{master_action}*",
+        f"",
+        f"{'━'*34}",
+        f"",
+        # ── MTF Score 3 khung ──
+        f"🌐 *MTF: {mtf_total}/100* `{bar_mtf}`",
+        f"  M *{mtf.get('monthly_score',0)}* | W *{mtf.get('weekly_score',0)}* | D *{score}*",
+        f"  M: _{mtf.get('monthly_note','')}_",
+        f"  W: _{mtf.get('weekly_note','')}_",
     ]
 
-    # ── Block MTF Decision (ưu tiên cao nhất) ──
-    if mtf:
-        mtf_warn = mtf.get("monthly_warning")
-        lines += [
-            f"🌐 *MTF DECISION: {mtf_total}/100* `{mtf_bar}`",
-            f"{mtf.get('decision_vi','—')}",
-            f"_{mtf.get('weights','')}_",
-        ]
-        if mtf_warn:
-            lines.append(f"{mtf_warn}")
-        lines += [
-            f"💰 DCA: _{mtf.get('dca_note','—')}_",
-            f"",
-            f"  Monthly *{mtf.get('monthly_score',0)}* | Weekly *{mtf.get('weekly_score',0)}* | Daily *{score}*",
-            f"  M: _{mtf.get('monthly_note','')}_",
-            f"  W: _{mtf.get('weekly_note','')}_",
-            f"",
-        ]
+    if mtf.get("monthly_warning"):
+        lines.append(f"  {mtf.get('monthly_warning')}")
 
-    # ── Block Confluence ──
-    if cf:
-        cf_score = cf.get("score", 0)
-        cf_level = cf.get("level", "")
-        lines += [
-            f"{'─'*34}",
-            f"🔍 *CONFLUENCE: {cf_score}/40 — {cf_level}*",
-        ]
-        for sig_name, sig_val in cf.get("signals", {}).items():
-            lines.append(f"  {sig_val}")
-        lines.append("")
-
-    # ── Block Trade Plan (dài hạn) ──
     lines += [
+        f"",
+        # ── Confluence ──
+        f"🔍 *Confluence: {cf_score}/40 — {cf.get('level','')}*",
+    ]
+    for sig_name, sig_val in cf.get("signals", {}).items():
+        # Rút gọn: bỏ tên signal key, chỉ giữ value
+        lines.append(f"  {sig_val}")
+
+    lines += [
+        f"",
         f"{'─'*34}",
-        f"🎯 *QUYẾT ĐỊNH DÀI HẠN (Daily)*",
-        f"{tp.get('decision_vi', '—')}",
-        f"_{tp.get('decision_note', '')}_",
+        # ── Vùng DCA ──
+        f"💰 *VÙNG DCA:*",
+        f"  🟢 Tầng 1 (EMA20): *{tp.get('dca_zone1','—')}*",
+        f"  🟡 Tầng 2 (EMA50): *{tp.get('dca_zone2','—')}*",
+        f"  🔵 Tầng 3 (BB Low): *{tp.get('dca_zone3','—')}*",
+        f"  📍 _{tp.get('dca_current_zone','')}_ | _{tp.get('dist_note','')}_",
         f"",
-        f"➡️ {tp.get('action_detail', '')}",
-        f"",
-    ]
-
-    # Trạng thái nắm giữ
-    lines += [
-        f"📌 *NẮM GIỮ:* {tp.get('hold_status', '')}",
-        f"  _{tp.get('hold_reason', '')}_",
+        # ── Hỗ trợ & Kháng cự ──
+        f"📐 *Hỗ trợ:* {fmt_price(tp.get('support_1'))} → {fmt_price(tp.get('support_2'))} → {fmt_price(tp.get('support_3'))}",
+        f"📐 *Kháng cự:* {fmt_price(tp.get('resistance'))}",
         f"",
     ]
 
-    # DCA zones
-    if decision in ["MUA_MANH", "TICH_LUY", "NAM_GIU", "THEO_DOI"]:
+    # ── Tín hiệu thoát — chỉ hiện khi có cảnh báo ──
+    if reversal >= 1:
+        bad_signals = [sig for sig, st in tp.get("reversal_detail", {}).items() if "XẤU" in st]
         lines += [
-            f"💰 *VÙNG DCA:*",
-            f"  🟢 Tầng 1 (EMA20): *{tp.get('dca_zone1', '—')}*",
-            f"  🟡 Tầng 2 (EMA50): *{tp.get('dca_zone2', '—')}*",
-            f"  🔵 Tầng 3 (BB Low): *{tp.get('dca_zone3', '—')}*",
-            f"  📍 {tp.get('dca_current_zone', '')}",
-            f"  _{tp.get('dist_note', '')}_",
+            f"⚠️ *Cảnh báo thoát ({reversal}/5):* {' | '.join(bad_signals)}",
             f"",
         ]
 
-    # Hỗ trợ & kháng cự
-    lines += [
-        f"📐 S1 *{fmt_price(tp.get('support_1'))}* S2 *{fmt_price(tp.get('support_2'))}* S3 *{fmt_price(tp.get('support_3'))}* | R *{fmt_price(tp.get('resistance'))}*",
-        f"",
-    ]
-
-    # Tín hiệu thoát (chỉ hiện khi có cảnh báo)
-    if reversal >= 1:
-        lines += [
-            f"⚠️ *THOÁT ({reversal}/5 tín hiệu):*",
-        ]
-        for sig_name, status in tp.get("reversal_detail", {}).items():
-            if "XẤU" in status:
-                lines.append(f"  {status}  {sig_name}")
-        lines.append("")
-
-    # ── Block kỹ thuật daily ──
     lines += [
         f"{'━'*34}",
-        f"📈 *KỸ THUẬT DAILY: {score}/100* `{bar}`",
-        f"",
-        f"C1 EMA+MACD+Vol   [{d['combo1']['score']:3d}%] {d['combo1']['signal']}",
-        f"C2 VWAP+OBV+BB    [{d['combo2']['score']:3d}%] {d['combo2']['signal']}",
-        f"C3 ST+StochRSI    [{d['combo3']['score']:3d}%] {d['combo3']['signal']}",
-        f"C4 MACD X+RSI+MFI [{d['combo4']['score']:3d}%] {d['combo4']['signal']}",
-        f"C5 Trend Strength [{d['combo5']['score']:3d}%] {d['combo5']['signal']}",
-        f"",
-        f"RSI {d['rsi14']:.0f} | MACD {d['macd']:+.3f} | ST: *{d['supertrend']}*",
-        f"EMA9/20/50: {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f}",
-        f"OBV: *{d['obv_trend']}* | CMF: {d['cmf20']:+.3f} | MFI: {d['mfi14']:.0f}",
+        # ── Kỹ thuật daily gọn ──
+        f"📈 *Daily: {score}/100* `{bar_daily}` | ST: *{d['supertrend']}* | RSI {d['rsi14']:.0f}",
+        f"C1:{d['combo1']['score']}% C2:{d['combo2']['score']}% C3:{d['combo3']['score']}% C4:{d['combo4']['score']}% C5:{d['combo5']['score']}%",
+        f"EMA {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f} | OBV:{d['obv_trend']} CMF:{d['cmf20']:+.3f}",
         f"Dòng tiền: *{tp.get('money_flow','—')}* | Trend: *{tp.get('trend_quality','—')}*",
     ]
+
+    return "\n".join(lines)
+
 
     return "\n".join(lines)
 
