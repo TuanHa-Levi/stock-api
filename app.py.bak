@@ -1,0 +1,173 @@
+import ssl, os, urllib3
+urllib3.disable_warnings()
+ssl._create_default_https_context = ssl._create_unverified_context
+
+import requests
+_orig = requests.Session.request
+def _patch(self, method, url, **kw):
+    kw['verify'] = False
+    return _orig(self, method, url, **kw)
+requests.Session.request = _patch
+
+from flask import Flask, jsonify
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+
+def _date_range(days=30):
+    end   = datetime.now().strftime('%Y-%m-%d')
+    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    return start, end
+
+def _rsi(closes, p=14):
+    if len(closes) < p+1: return 50.0
+    g = [max(closes[i]-closes[i-1],0) for i in range(1,len(closes))]
+    l = [max(closes[i-1]-closes[i],0) for i in range(1,len(closes))]
+    ag, al = sum(g[-p:])/p, sum(l[-p:])/p
+    return 100.0 if al==0 else round(100-(100/(1+ag/al)),2)
+
+def _rsi_label(r):
+    if r<30: return "QUA BAN - co the mua"
+    if r>70: return "QUA MUA - can than"
+    if r<45: return "Yeu"
+    if r>55: return "Manh"
+    return "Trung lap"
+
+@app.route('/')
+def health():
+    return jsonify({"status":"ok","message":"Stock API OK",
+                    "time":datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+
+@app.route('/vnindex')
+def get_vnindex():
+    try:
+        from vnstock import Quote
+        start, end = _date_range(30)
+        quote = Quote(symbol='VNINDEX', source='KBS')
+        df = quote.history(start=start, end=end, interval='1D')
+        if df is not None and not df.empty:
+            latest = df.iloc[-1]
+            prev   = df.iloc[-2] if len(df)>1 else latest
+            close  = float(latest['close'])
+            prev_c = float(prev['close'])
+            change = round(close-prev_c, 2)
+            pct    = round(change/prev_c*100, 2) if prev_c else 0
+            return jsonify({
+                "symbol":"VNINDEX","source":"KBS",
+                "close":close,"open":float(latest['open']),
+                "high":float(latest['high']),"low":float(latest['low']),
+                "volume":float(latest['volume']),
+                "change":change,"change_pct":pct,
+                "trend":"TANG" if change>=0 else "GIAM",
+                "date":str(latest['time'])[:10]
+            })
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+    return jsonify({"error":"Khong lay duoc VNINDEX"}), 500
+
+@app.route('/stock/<symbol>')
+def get_stock(symbol):
+    symbol = symbol.upper()
+    try:
+        from vnstock import Quote
+        start, end = _date_range(40)
+        quote = Quote(symbol=symbol, source='KBS')
+        df = quote.history(start=start, end=end, interval='1D')
+        if df is None or df.empty:
+            return jsonify({"error":f"Khong tim thay {symbol}"}), 404
+        latest = df.iloc[-1]
+        prev   = df.iloc[-2] if len(df)>1 else latest
+        close  = float(latest['close'])
+        prev_c = float(prev['close'])
+        change = round(close-prev_c, 2)
+        pct    = round(change/prev_c*100, 2) if prev_c else 0
+        closes = df['close'].astype(float).tolist()
+        rsi    = _rsi(closes)
+        return jsonify({
+            "symbol":symbol,"source":"KBS",
+            "close":close,"open":float(latest['open']),
+            "high":float(latest['high']),"low":float(latest['low']),
+            "volume":float(latest['volume']),
+            "change":change,"change_pct":pct,
+            "trend":"TANG" if change>=0 else "GIAM",
+            "rsi_14":rsi,"rsi_signal":_rsi_label(rsi),
+            "ma10":round(sum(closes[-10:])/min(len(closes),10),2),
+            "ma20":round(sum(closes[-20:])/min(len(closes),20),2),
+            "date":str(latest['time'])[:10]
+        })
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route('/sectors')
+def get_sectors():
+    sector_map = {
+        "Ngan hang":    ["VCB","BID","TCB","MBB","VPB"],
+        "Dau khi":      ["PVT","GAS","PVS","BSR"],
+        "Bat dong san": ["VHM","VIC","KDH","NLG"],
+        "Cong nghe":    ["FPT","CMG"],
+        "Thep":         ["HPG","NKG"],
+        "Phan bon":     ["DCM","DPM"],
+        "Cang bien":    ["GMD","HAH"],
+        "Ban le":       ["MWG","FRT"],
+    }
+    results = []
+    try:
+        from vnstock import Quote
+        for sector, syms in sector_map.items():
+            changes, vol = [], 0
+            for sym in syms:
+                try:
+                    start = (datetime.now()-timedelta(days=7)).strftime('%Y-%m-%d')
+                    end   = datetime.now().strftime('%Y-%m-%d')
+                    df = Quote(symbol=sym, source='KBS').history(start=start, end=end, interval='1D')
+                    if df is not None and len(df)>=2:
+                        c = float(df.iloc[-1]['close'])
+                        p = float(df.iloc[-2]['close'])
+                        if p: changes.append((c-p)/p*100)
+                        vol += float(df.iloc[-1]['volume'])
+                except: continue
+            if changes:
+                avg = round(sum(changes)/len(changes), 2)
+                results.append({
+                    "sector":sector,"avg_change_pct":avg,
+                    "total_volume":int(vol),
+                    "signal":"DONG TIEN VAO" if avg>0.5 else ("DONG TIEN RA" if avg<-0.5 else "TRUNG LAP")
+                })
+        results.sort(key=lambda x: x['avg_change_pct'], reverse=True)
+        return jsonify({"sectors":results,"updated_at":datetime.now().strftime('%Y-%m-%d %H:%M')})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route('/macro')
+def get_macro():
+    result = {}
+    try:
+        av_key = os.environ.get('ALPHA_VANTAGE_KEY','')
+        if av_key:
+            r = requests.get(
+                f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE"
+                f"&from_currency=XAU&to_currency=USD&apikey={av_key}", timeout=10)
+            d = r.json().get('Realtime Currency Exchange Rate',{})
+            if d:
+                result['XAUUSD'] = {"price":float(d['5. Exchange Rate']),"updated":d['6. Last Refreshed']}
+    except Exception as e:
+        result['XAUUSD_error'] = str(e)
+    result['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    return jsonify(result)
+
+@app.route('/news')
+def get_news():
+    try:
+        key = os.environ.get('NEWS_API_KEY','')
+        if not key: return jsonify({"error":"Chua co NEWS_API_KEY"}), 400
+        r = requests.get(
+            f"https://newsapi.org/v2/everything?q=chung+khoan+Viet+Nam"
+            f"&language=vi&sortBy=publishedAt&pageSize=5&apiKey={key}", timeout=10)
+        arts = [{"title":a['title'],"source":a['source']['name'],"published":a['publishedAt'][:10]}
+                for a in r.json().get('articles',[])]
+        return jsonify({"news":arts})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+if __name__=='__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))

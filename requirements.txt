@@ -1,0 +1,7 @@
+flask
+requests
+vnstock
+anthropic
+pytz
+urllib3
+gunicorn
