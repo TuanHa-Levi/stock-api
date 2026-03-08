@@ -1,7 +1,7 @@
 # ============================================================
-# app.py — Stock API với Full Combo Technical Analysis
+# app.py — Stock API với Full Combo Technical Analysis v4.0
 # VPS Nhân Hòa | Source: VCI (primary) → TCBS → KBS (fallback)
-# Dòng tiền thực: vnstock intraday buy/sell
+# v4.0: Dynamic Combo Weights | Sector RS | Foreign Flow | Kelly Sizing
 # ============================================================
 import ssl, os, urllib3
 os.environ["PYTHONHTTPSVERIFY"] = "0"
@@ -28,6 +28,62 @@ import math
 import pandas as pd
 
 app = Flask(__name__)
+
+# ══════════════════════════════════════════════════════════════
+# V4.0 CONSTANTS — Sector mapping, Dynamic weights, Kelly
+# ══════════════════════════════════════════════════════════════
+
+# Map mã → ngành
+SYMBOL_SECTOR_MAP = {
+    # Ngân hàng
+    "VCB":"Ngan hang","BID":"Ngan hang","CTG":"Ngan hang","TCB":"Ngan hang",
+    "MBB":"Ngan hang","VPB":"Ngan hang","ACB":"Ngan hang","STB":"Ngan hang",
+    "HDB":"Ngan hang","LPB":"Ngan hang","MSB":"Ngan hang","VIB":"Ngan hang",
+    "OCB":"Ngan hang","BAB":"Ngan hang","NAB":"Ngan hang","SSB":"Ngan hang",
+    # Dầu khí
+    "GAS":"Dau khi","PVD":"Dau khi","PVS":"Dau khi","PVT":"Dau khi",
+    "BSR":"Dau khi","OIL":"Dau khi","PLX":"Dau khi",
+    # Thép
+    "HPG":"Thep","NKG":"Thep","HSG":"Thep","TVN":"Thep",
+    # Bất động sản
+    "VHM":"BDS","VIC":"BDS","KDH":"BDS","NVL":"BDS","PDR":"BDS","DXG":"BDS",
+    "BCM":"BDS","SZC":"BDS","IDC":"BDS","KBC":"BDS",
+    # Công nghệ
+    "FPT":"CNTT","CMG":"CNTT","VGI":"CNTT","ELC":"CNTT",
+    # Cảng biển / Logistics
+    "GMD":"Cang bien","HAH":"Cang bien","VSC":"Cang bien","DVP":"Cang bien","HHV":"Cang bien",
+    # Phân bón
+    "DCM":"Phan bon","DPM":"Phan bon","DGC":"Phan bon",
+    # Tiêu dùng / Thực phẩm
+    "VNM":"Thuc pham","MSN":"Thuc pham","SAB":"Thuc pham","QNS":"Thuc pham","ANV":"Thuc pham",
+    # Bán lẻ
+    "MWG":"Ban le","PNJ":"Ban le","FRT":"Ban le",
+    # Chứng khoán
+    "VCI":"Chung khoan","HCM":"Chung khoan","SSI":"Chung khoan","VND":"Chung khoan","FTS":"Chung khoan","BSI":"Chung khoan",
+}
+
+# Benchmark cho từng ngành (dùng trong Confluence D thay VNINDEX)
+SECTOR_BENCHMARKS = {
+    "Ngan hang":  ["VCB","BID","TCB"],
+    "Dau khi":    ["GAS","PVS","PVD"],
+    "Thep":       ["HPG"],
+    "BDS":        ["VHM","VIC"],
+    "CNTT":       ["FPT"],
+    "Cang bien":  ["GMD","HAH"],
+    "Phan bon":   ["DCM","DPM"],
+    "Thuc pham":  ["VNM","MSN"],
+    "Ban le":     ["MWG"],
+    "Chung khoan":["SSI","VND"],
+}
+
+# Trọng số Combo động theo Regime (v4.0)
+REGIME_COMBO_WEIGHTS = {
+    "TRENDING":   {"c1":0.30,"c2":0.15,"c3":0.25,"c4":0.20,"c5":0.10},
+    "BREAKOUT":   {"c1":0.25,"c2":0.10,"c3":0.30,"c4":0.25,"c5":0.10},
+    "RANGING":    {"c1":0.15,"c2":0.30,"c3":0.15,"c4":0.20,"c5":0.20},
+    "TRANSITION": {"c1":0.20,"c2":0.20,"c3":0.20,"c4":0.20,"c5":0.20},
+    "DEFAULT":    {"c1":0.25,"c2":0.20,"c3":0.20,"c4":0.20,"c5":0.15},
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -349,6 +405,74 @@ def get_price_board_batch(symbols_list):
         return board
     except Exception:
         return None
+
+def get_sector_benchmark(symbol):
+    """Lấy closes benchmark của ngành cho symbol — dùng Confluence D
+    Returns: (sector_name, avg_closes_list, bench_label) hoặc (None,None,None)
+    """
+    sector = SYMBOL_SECTOR_MAP.get(symbol.upper())
+    if not sector:
+        return None, None, None
+    bench_syms = [s for s in SECTOR_BENCHMARKS.get(sector, []) if s != symbol.upper()]
+    if not bench_syms:
+        return sector, None, None
+    all_closes = []
+    for sym in bench_syms[:3]:  # Tối đa 3 mã để không chậm
+        try:
+            df_b = get_stock_data(sym, 30)
+            if df_b is not None and len(df_b) >= 20:
+                all_closes.append(df_b['close'].astype(float).tolist())
+        except Exception:
+            continue
+    if not all_closes:
+        return sector, None, None
+    min_len = min(len(c) for c in all_closes)
+    avg_closes = [
+        sum(c[len(c)-min_len+i] for c in all_closes) / len(all_closes)
+        for i in range(min_len)
+    ]
+    bench_label = f"Ngành {sector} ({'/'.join(bench_syms[:3])})"
+    return sector, avg_closes, bench_label
+
+
+def calc_kelly_size(mtf_total, cf_score, reversal):
+    """Kelly Criterion đơn giản — đề xuất % vốn mỗi lần DCA
+    Tier  | Điều kiện                   | % mỗi DCA | Max 1 mã
+    STRONG| MTF≥75, CF≥30, rev≤1        | 5–8%      | 25%
+    NORMAL| MTF≥60, CF≥20, rev≤1        | 3–5%      | 20%
+    WEAK  | MTF≥50, CF≥15, rev≤1        | 1–3%      | 15%
+    NONE  | Còn lại                     | 0%        | Không vào
+    """
+    if reversal >= 2 or mtf_total < 50:
+        return {
+            "tier": "NONE", "pct_per_dca": "0%",
+            "max_position": "Không vào", "note": "Rủi ro cao — không DCA",
+            "allocation_40_35_25": None,
+        }
+    if mtf_total >= 75 and cf_score >= 30:
+        return {
+            "tier": "STRONG", "pct_per_dca": "5–8%",
+            "max_position": "25% vốn", "note": "Tín hiệu rất mạnh — vào đủ 3 tầng",
+            "allocation_40_35_25": "Tầng1: 40% | Tầng2: 35% | Tầng3: 25%",
+        }
+    if mtf_total >= 60 and cf_score >= 20:
+        return {
+            "tier": "NORMAL", "pct_per_dca": "3–5%",
+            "max_position": "20% vốn", "note": "Tín hiệu đủ mạnh — DCA 2 tầng",
+            "allocation_40_35_25": "Tầng1: 50% | Tầng2: 50% | Tầng3: chờ",
+        }
+    if mtf_total >= 50 and cf_score >= 15:
+        return {
+            "tier": "WEAK", "pct_per_dca": "1–3%",
+            "max_position": "15% vốn", "note": "Tích lũy thận trọng — chỉ tầng 1",
+            "allocation_40_35_25": "Tầng1: 100% | Tầng2+3: chờ thêm tín hiệu",
+        }
+    return {
+        "tier": "NONE", "pct_per_dca": "0%",
+        "max_position": "Không vào", "note": "Chưa đủ điều kiện",
+        "allocation_40_35_25": None,
+    }
+
 
 # ══════════════════════════════════════════════════════════════
 # SMART DCA ENGINE — Hybrid Regime + Confluence Zones
@@ -912,31 +1036,79 @@ def calc_confluence(closes, highs, lows, opens, volumes, rsi_series, ema20, ema5
     signals["C. Volume Dry-up"] = f"{'✅' if c_score > 0 else '❌'} {c_note} (+{c_score}đ)"
     confluence_score += c_score
 
-    # ── D: Relative Strength vs VNINDEX ──
-    d_score = 0; d_note = ""
+    # ── D: Relative Strength vs Sector Benchmark (v4.0) ──
+    # Ưu tiên so với ngành — fallback VNINDEX nếu không có sector data
+    d_score = 0; d_note = ""; d_label = "D. Sức mạnh vs Ngành/VNIndex"
     try:
-        df_vni = get_stock_data('VNINDEX', days=40)
-        if df_vni is not None and len(df_vni) >= 20:
-            vni_closes  = df_vni['close'].astype(float).tolist()
-            rs_stock_pct = (closes[-1] - closes[-20]) / closes[-20] * 100 if closes[-20] != 0 else 0
-            rs_vni_pct   = (vni_closes[-1] - vni_closes[-20]) / vni_closes[-20] * 100 if vni_closes[-20] != 0 else 0
-            outperform   = round(rs_stock_pct - rs_vni_pct, 1)
+        sector, bench_closes, bench_label = get_sector_benchmark(symbol)
+        rs_stock_pct = (closes[-1] - closes[-20]) / closes[-20] * 100 if len(closes)>=20 and closes[-20] != 0 else 0
+
+        if bench_closes and len(bench_closes) >= 20:
+            # So với benchmark ngành
+            rs_bench_pct = (bench_closes[-1] - bench_closes[-20]) / bench_closes[-20] * 100 if bench_closes[-20] != 0 else 0
+            outperform   = round(rs_stock_pct - rs_bench_pct, 1)
+            d_label      = f"D. Sức mạnh vs {bench_label}"
             if outperform >= 5:
                 d_score = 10
-                d_note  = f"Vượt trội VNIndex +{outperform:.1f}% (20 ngày) 🔥"
+                d_note  = f"Dẫn đầu ngành +{outperform:.1f}% (20 ngày) 🔥"
             elif outperform >= 0:
                 d_score = 5
-                d_note  = f"Nhỉnh hơn VNIndex +{outperform:.1f}% (20 ngày)"
+                d_note  = f"Nhỉnh hơn ngành +{outperform:.1f}% (20 ngày)"
             elif outperform >= -5:
-                d_note  = f"Ngang thị trường ({outperform:+.1f}% vs VNIndex)"
+                d_note  = f"Ngang ngành ({outperform:+.1f}% so với {bench_label})"
             else:
-                d_note  = f"Yếu hơn VNIndex {outperform:.1f}% (20 ngày) ⚠️"
+                d_note  = f"Yếu hơn ngành {outperform:.1f}% ⚠️"
         else:
-            d_note = "Không lấy được data VNINDEX"
-    except Exception:
-        d_note = "Lỗi khi lấy VNINDEX"
-    signals["D. Sức mạnh vs VNINDEX"] = f"{'✅' if d_score > 0 else '❌'} {d_note} (+{d_score}đ)"
+            # Fallback: so với VNINDEX
+            df_vni = get_stock_data('VNINDEX', days=40)
+            if df_vni is not None and len(df_vni) >= 20:
+                vni_closes  = df_vni['close'].astype(float).tolist()
+                rs_vni_pct  = (vni_closes[-1] - vni_closes[-20]) / vni_closes[-20] * 100 if vni_closes[-20] != 0 else 0
+                outperform  = round(rs_stock_pct - rs_vni_pct, 1)
+                d_label     = "D. Sức mạnh vs VNIndex"
+                if outperform >= 5:
+                    d_score = 10; d_note = f"Vượt trội VNIndex +{outperform:.1f}% 🔥"
+                elif outperform >= 0:
+                    d_score = 5;  d_note = f"Nhỉnh hơn VNIndex +{outperform:.1f}%"
+                elif outperform >= -5:
+                    d_note = f"Ngang thị trường ({outperform:+.1f}%)"
+                else:
+                    d_note = f"Yếu hơn VNIndex {outperform:.1f}% ⚠️"
+            else:
+                d_note = "Không lấy được benchmark"
+    except Exception as ex:
+        d_note = f"Lỗi khi tính RS: {ex}"
+    signals[d_label] = f"{'✅' if d_score > 0 else '❌'} {d_note} (+{d_score}đ)"
     confluence_score += d_score
+
+    # ── E: Foreign Flow Bonus (v4.0) — từ price_board VCI ──
+    e_score = 0; e_note = ""
+    try:
+        board = get_price_board_batch([symbol])
+        if board is not None and not board.empty:
+            row = board[board.iloc[:,0] == symbol] if board.iloc[:,0].dtype == object else board
+            if not row.empty:
+                row = row.iloc[0]
+                # Tìm cột foreign buy/sell
+                fb_col = next((c for c in board.columns if 'foreign' in c.lower() and 'buy' in c.lower()), None)
+                fs_col = next((c for c in board.columns if 'foreign' in c.lower() and 'sell' in c.lower()), None)
+                if fb_col and fs_col:
+                    fb = float(row.get(fb_col, 0) or 0)
+                    fs = float(row.get(fs_col, 0) or 0)
+                    fn = fb - fs
+                    if fn > 50000:  # Khối ngoại mua ròng >50K CP
+                        e_score = 5
+                        e_note  = f"Khối ngoại mua ròng +{fn/1e6:.1f}M CP 🌏"
+                    elif fn < -50000:
+                        e_note  = f"Khối ngoại bán ròng {fn/1e6:.1f}M CP ⚠️"
+                    else:
+                        e_note  = f"Khối ngoại trung lập ({fn/1000:+.0f}K CP)"
+    except Exception:
+        pass  # Foreign flow là bonus — lỗi thì bỏ qua
+
+    if e_note:
+        signals["E. Khối ngoại (bonus)"] = f"{'✅' if e_score > 0 else '⚪'} {e_note} (+{e_score}đ)"
+        confluence_score += e_score
 
     # ── Phân loại Confluence ──
     if confluence_score >= 30:
@@ -950,10 +1122,10 @@ def calc_confluence(closes, highs, lows, opens, volumes, rsi_series, ema20, ema5
 
     return {
         "score":      confluence_score,
-        "max_score":  40,
+        "max_score":  45,  # v4.0: A+B+C+D(40) + E bonus(5)
         "level":      cf_level,
         "signals":    signals,
-        "note":       f"Confluence {confluence_score}/40 — {cf_level}",
+        "note":       f"Confluence {confluence_score}/45 — {cf_level}",  # 40 base + 5 foreign bonus
     }
 
 def calc_mtf(df_daily, daily_score, symbol):
@@ -1241,12 +1413,19 @@ def run_combo_analysis(symbol):
     else:               c5_signal = "STRONG SELL 🔴🔴"
 
     # ══════════════════════════════════════════════════════════
-    # TỔNG HỢP — Weighted Score
+    # TỔNG HỢP — Dynamic Weighted Score (v4.0)
+    # Trọng số tự động điều chỉnh theo Market Regime
     # ══════════════════════════════════════════════════════════
-    # Weights: C1=25%, C2=20%, C3=20%, C4=20%, C5=15%
-    weights = [0.25, 0.20, 0.20, 0.20, 0.15]
+    # Tính regime sớm để dùng cho dynamic weights
+    _adx_early = calc_adx(highs, lows, closes, 14)
+    _regime_early, _ = detect_regime(closes, highs, lows, volumes, _adx_early)
+    w_dict = REGIME_COMBO_WEIGHTS.get(_regime_early, REGIME_COMBO_WEIGHTS["DEFAULT"])
+    weights = [w_dict["c1"], w_dict["c2"], w_dict["c3"], w_dict["c4"], w_dict["c5"]]
     scores  = [c1_pct, c2_pct, c3_pct, c4_pct, c5_pct]
     total_score = int(sum(w * s for w, s in zip(weights, scores)))
+    weight_note = (f"Regime: {_regime_early} → "
+                   f"C1={w_dict['c1']*100:.0f}% C2={w_dict['c2']*100:.0f}% "
+                   f"C3={w_dict['c3']*100:.0f}% C4={w_dict['c4']*100:.0f}% C5={w_dict['c5']*100:.0f}%")
 
     # Quyết định tổng hợp
     if total_score >= 70:
@@ -1520,6 +1699,7 @@ def run_combo_analysis(symbol):
         "entry":       latest_close,
         "atr14":       atr14,
         "trade_plan":  trade_plan,
+        "weight_note": weight_note,
         "mtf":         calc_mtf(df, total_score, symbol),
         "confluence":  calc_confluence(
                            closes, highs, lows,
@@ -1529,6 +1709,7 @@ def run_combo_analysis(symbol):
                            ema20, ema50, symbol
                        ),
         "smart_dca":   smart_dca,
+        "_kelly":      None,  # filled below
     }, None
 
 # ══════════════════════════════════════════════════════════════
@@ -1537,11 +1718,22 @@ def run_combo_analysis(symbol):
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "message": "Stock API v3 — vnstock VCI primary | Combo Engine ready"})
+    return jsonify({"status": "ok", "message": "Stock API v4 — Dynamic Weights | Sector RS | Foreign Flow | Kelly Sizing"})
 
 @app.route("/combo/<symbol>")
 def get_combo(symbol):
     result, err = run_combo_analysis(symbol)
+    if result:
+        # Thêm Kelly sizing (cần MTF + Confluence đã tính xong)
+        mtf_data  = result.get("mtf", {})
+        cf_data   = result.get("confluence", {})
+        reversal  = result.get("trade_plan", {}).get("reversal_count", 0)
+        result["kelly_size"] = calc_kelly_size(
+            mtf_data.get("mtf_total", 0),
+            cf_data.get("score", 0),
+            reversal
+        )
+        result["_kelly"] = result["kelly_size"]
     if err:
         return jsonify({"error": err}), 404
     return jsonify(result)
