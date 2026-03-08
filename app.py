@@ -1,6 +1,7 @@
 # ============================================================
 # app.py — Stock API với Full Combo Technical Analysis
-# VPS Nhân Hòa | Source: KBS (hoạt động trên cloud)
+# VPS Nhân Hòa | Source: VCI (primary) → TCBS → KBS (fallback)
+# Dòng tiền thực: vnstock intraday buy/sell
 # ============================================================
 import ssl, os, urllib3
 os.environ["PYTHONHTTPSVERIFY"] = "0"
@@ -16,6 +17,11 @@ _req.Session.request = _noverify
 
 from flask import Flask, jsonify
 from vnstock import Quote
+try:
+    from vnstock import Vnstock, Trading as VnTrading
+except ImportError:
+    Vnstock = None
+    VnTrading = None
 import requests
 from datetime import datetime, timedelta
 import math
@@ -264,16 +270,84 @@ def calc_mfi(highs, lows, closes, volumes, period=14):
     return round(100 - (100 / (1 + mfr)), 2)
 
 def get_stock_data(symbol, days=400):
-    """Pull data từ KBS — source hoạt động trên mọi cloud server"""
-    end = datetime.now().strftime("%Y-%m-%d")
+    """Pull OHLCV — VCI (primary) → TCBS → KBS (fallback)
+    Tất cả source đều trả về giá đơn vị nghìn đồng.
+    """
+    end   = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    for source in ['VCI', 'TCBS', 'KBS']:
+        try:
+            df = Quote(symbol=symbol, source=source).history(
+                start=start, end=end, interval='1D'
+            )
+            if df is None or df.empty or len(df) < 5:
+                continue
+            # Chuẩn hóa: lowercase cols, numeric types
+            df.columns = [c.lower() for c in df.columns]
+            for col in ['open', 'high', 'low', 'close']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            if 'volume' in df.columns:
+                df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+            df = df.sort_values('time').reset_index(drop=True)
+            df['_source'] = source
+            return df
+        except Exception:
+            continue
+    return None
+
+
+def get_real_money_flow(symbol):
+    """Dòng tiền thực từ lệnh intraday buy/sell — vnstock VCI/TCBS
+    Chỉ hoạt động trong giờ giao dịch (9:00–15:00).
+    Returns dict hoặc None nếu ngoài giờ / lỗi.
+    """
+    if Vnstock is None:
+        return None
+    for source in ['VCI', 'TCBS']:
+        try:
+            stock = Vnstock().stock(symbol=symbol, source=source)
+            df = stock.quote.intraday()
+            if df is None or df.empty:
+                continue
+            df_bs = df[df['match_type'].isin(['Buy', 'Sell'])]
+            if df_bs.empty:
+                continue
+            buy_vol  = int(df_bs[df_bs['match_type'] == 'Buy']['volume'].sum())
+            sell_vol = int(df_bs[df_bs['match_type'] == 'Sell']['volume'].sum())
+            total    = buy_vol + sell_vol
+            if total == 0:
+                continue
+            return {
+                "source":           source,
+                "buy_vol":          buy_vol,
+                "sell_vol":         sell_vol,
+                "net_vol":          buy_vol - sell_vol,
+                "buy_pct":          round(buy_vol / total * 100, 1),
+                "sell_pct":         round(sell_vol / total * 100, 1),
+                "active_buy_ratio": round(buy_vol / total, 3),
+                "dominant":         "BUY 🟢" if buy_vol > sell_vol else "SELL 🔴",
+            }
+        except Exception:
+            continue
+    return None
+
+
+def get_price_board_batch(symbols_list):
+    """Lấy bảng giá realtime nhiều mã (vnstock VCI) — dùng cho /sectors nhanh hơn
+    Returns DataFrame hoặc None.
+    """
+    if VnTrading is None:
+        return None
     try:
-        df = Quote(symbol=symbol, source='KBS').history(start=start, end=end, interval='1D')
-        if df is None or df.empty:
-            return None
-        df = df.sort_values('time').reset_index(drop=True)
-        return df
-    except Exception as e:
+        trading = VnTrading(source='VCI', symbol=symbols_list[0])
+        board = trading.price_board(
+            symbols_list=symbols_list,
+            flatten_columns=True,
+            drop_levels=[0]
+        )
+        return board
+    except Exception:
         return None
 
 # ══════════════════════════════════════════════════════════════
@@ -591,7 +665,7 @@ def calc_smart_dca(closes, highs, lows, volumes, df_weekly,
     zone_high   = round(max(prices) * 1.005, 2)
     dist_pct    = round((zone_center - current_price) / current_price * 100, 1)
 
-    # Format giá đúng đơn vị — nhân 1000 nếu < 1000 (KBS trả về đơn vị nghìn đồng)
+    # Format giá đúng đơn vị — nhân 1000 nếu < 1000 (VCI/TCBS/KBS đều trả về nghìn đồng)
     def fmt_zone_price(p):
         if p < 1000:
             return f"{p*1000:,.0f}đ"
@@ -1463,7 +1537,7 @@ def run_combo_analysis(symbol):
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "message": "Stock API v2 — Combo Engine ready"})
+    return jsonify({"status": "ok", "message": "Stock API v3 — vnstock VCI primary | Combo Engine ready"})
 
 @app.route("/combo/<symbol>")
 def get_combo(symbol):
@@ -1474,6 +1548,32 @@ def get_combo(symbol):
 
 @app.route("/vnindex")
 def get_vnindex():
+    # ── Thử vnstock VCI trước ──
+    try:
+        end   = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+        df = Quote(symbol='VNINDEX', source='VCI').history(start=start, end=end, interval='1D')
+        if df is not None and not df.empty:
+            df.columns = [c.lower() for c in df.columns]
+            df = df.sort_values('time')
+            latest = df.iloc[-1]; prev = df.iloc[-2] if len(df) > 1 else latest
+            close = float(latest['close']); ref = float(prev['close'])
+            open_ = float(latest['open'])
+            # VCI trả về nghìn điểm nếu < 1000 → nhân 1000
+            if close < 1000:
+                close *= 1000; ref *= 1000; open_ *= 1000
+            change = close - ref; pct = (change / ref * 100) if ref else 0
+            if close > 0:
+                return jsonify({
+                    "symbol": "VNINDEX", "source": "VCI",
+                    "close": round(close, 2), "open": round(open_, 2),
+                    "change": round(change, 2), "change_pct": round(pct, 2),
+                    "trend": "TANG" if change >= 0 else "GIAM",
+                    "date": str(latest['time'])[:10],
+                })
+    except: pass
+
+    # ── Fallback: SSI iBoard ──
     try:
         r = requests.get(
             "https://iboard-query.ssi.com.vn/v2/stock/snapshot?market=HOSE&symbol=VNIndex",
@@ -1486,8 +1586,7 @@ def get_vnindex():
             close = float(data.get("lastPrice") or data.get("close") or 0)
             ref   = float(data.get("refPrice") or data.get("referencePrice") or close)
             open_ = float(data.get("openPrice") or data.get("open") or close)
-            change = close - ref
-            pct    = (change / ref * 100) if ref else 0
+            change = close - ref; pct = (change / ref * 100) if ref else 0
             if close > 0:
                 return jsonify({
                     "symbol": "VNINDEX", "source": "SSI",
@@ -1592,6 +1691,22 @@ def get_news():
         return jsonify({"news": arts})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/moneyflow/<symbol>")
+def get_money_flow(symbol):
+    """Dòng tiền thực intraday — lệnh mua/bán chủ động (vnstock)"""
+    symbol = symbol.upper()
+    mf = get_real_money_flow(symbol)
+    if mf is None:
+        return jsonify({
+            "symbol": symbol,
+            "note": "Không có data intraday (ngoài giờ GD hoặc lỗi)",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+    mf["symbol"] = symbol
+    mf["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return jsonify(mf)
+
 
 # ══════════════════════════════════════════════════════════════
 # AUTO DEPLOY — GitHub Webhook
