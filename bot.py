@@ -4,8 +4,9 @@
 # Source: vnstock VCI (primary) → TCBS → KBS fallback
 # Tự động nhận diện mã cổ phiếu trong bất kỳ tin nhắn nào
 # ============================================================
-import os, re, json, time, logging, requests
+import os, re, json, time, logging, requests, threading
 import anthropic
+import portfolio as portfolio_module
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -648,6 +649,48 @@ def process_message(msg):
             send_message(chat_id, "\n".join(lines))
         else:
             send_message(chat_id, "❌ Không lấy được tin tức")
+        return
+
+    # ── Portfolio commands (MVP2) ──
+    def _pf_send(msg_text): send_message(chat_id, msg_text)
+
+    # Thêm vào danh mục
+    if any(kw in text_lower for kw in ["thêm", "them ", "theo dõi"]):
+        symbols = re.findall(r'([A-Z]{2,4})', text_upper)
+        noise = {"NO","OK","VN","TK","TP","SL","GD","AI","THEM","ADD","BOV","VAO","THEO","DOI","THANH"}
+        syms = [s for s in symbols if s not in noise and len(s) >= 2]
+        if syms:
+            portfolio_module.handle_add(chat_id, syms, _pf_send)
+            return
+
+    # Xóa khỏi danh mục
+    if any(kw in text_lower for kw in ["xóa", "xoa ", "loại ", "loai "]):
+        symbols = re.findall(r'([A-Z]{2,4})', text_upper)
+        noise = {"NO","OK","VN","XOA","LOAI","REMOVE","DELETE"}
+        syms = [s for s in symbols if s not in noise and len(s) >= 2]
+        if syms:
+            portfolio_module.handle_remove(chat_id, syms, _pf_send)
+            return
+
+    # Xem danh mục
+    if any(kw in text_lower for kw in [
+        "danh mục của tôi", "danh muc cua toi", "xem danh mục", "xem danh muc",
+        "/dm", "watchlist", "đang theo dõi", "dang theo doi", "/portfolio"
+    ]):
+        portfolio_module.handle_list(chat_id, [], _pf_send)
+        return
+
+    # Phân tích toàn bộ danh mục
+    if any(kw in text_lower for kw in [
+        "phân tích danh mục", "phan tich danh muc", "scan danh mục",
+        "quét danh mục", "quet danh muc", "phân tích tất cả",
+        "check danh mục", "danh mục hôm nay"
+    ]):
+        threading.Thread(
+            target=portfolio_module.handle_analyze_all,
+            args=(chat_id, [], _pf_send),
+            daemon=True
+        ).start()
         return
 
     # ── Auto-detect mã cổ phiếu ──
