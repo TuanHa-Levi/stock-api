@@ -4,9 +4,9 @@
 # Source: vnstock VCI (primary) → TCBS → KBS fallback
 # Tự động nhận diện mã cổ phiếu trong bất kỳ tin nhắn nào
 # ============================================================
-import os, re, json, time, logging, requests, threading
+import os, re, json, time, logging, requests, threading, subprocess, unicodedata
 import anthropic
-import portfolio as portfolio_module
+import portfolio as pf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -70,16 +70,6 @@ def send_typing(chat_id):
                       json={"chat_id": chat_id, "action": "typing"}, timeout=5)
     except: pass
 
-def get_updates(offset=None, timeout=30):
-    params = {"timeout": timeout, "allowed_updates": ["message"]}
-    if offset:
-        params["offset"] = offset
-    try:
-        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=timeout+5)
-        return r.json().get("result", [])
-    except: return []
-
-# ── Stock API ──
 def api_get(path, timeout=25):
     try:
         r = requests.get(f"{STOCK_API_URL}{path}", timeout=timeout)
@@ -458,8 +448,153 @@ def claude_with_combo(symbol: str, d: dict) -> str:
 # ── Alert integration ──
 ALERT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.py")
 
+
+# ══════════════════════════════════════════════════════════════
+# CONVERSATION STATE MACHINE
+# ══════════════════════════════════════════════════════════════
+# CONV_STATE[chat_id] = {"step": str, "data": dict}
+CONV_STATE: dict = {}
+
+def get_state(chat_id):
+    return CONV_STATE.get(str(chat_id), {})
+
+def set_state(chat_id, step, data=None):
+    CONV_STATE[str(chat_id)] = {"step": step, "data": data or {}}
+
+def clear_state(chat_id):
+    CONV_STATE.pop(str(chat_id), None)
+
+
+# ══════════════════════════════════════════════════════════════
+# TELEGRAM — INLINE KEYBOARD & CALLBACK HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def send_keyboard(chat_id, text, buttons, parse_mode="Markdown"):
+    """Gửi message kèm inline keyboard.
+    buttons = [[("Label", "callback_data"), ...], ...]  (list of rows)
+    """
+    inline_keyboard = [
+        [{"text": label, "callback_data": cb} for label, cb in row]
+        for row in buttons
+    ]
+    try:
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+            "reply_markup": {"inline_keyboard": inline_keyboard}
+        }, timeout=30)
+        return r.json()
+    except Exception as e:
+        log.error(f"send_keyboard error: {e}")
+
+def edit_keyboard(chat_id, message_id, text, buttons, parse_mode="Markdown"):
+    """Sửa message + keyboard cũ"""
+    inline_keyboard = [
+        [{"text": label, "callback_data": cb} for label, cb in row]
+        for row in buttons
+    ]
+    try:
+        requests.post(f"{TELEGRAM_API}/editMessageText", json={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "reply_markup": {"inline_keyboard": inline_keyboard}
+        }, timeout=10)
+    except Exception as e:
+        log.error(f"edit_keyboard error: {e}")
+
+def answer_callback(callback_query_id, text=""):
+    """Tắt loading spinner trên button"""
+    try:
+        requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
+            "callback_query_id": callback_query_id,
+            "text": text
+        }, timeout=5)
+    except: pass
+
+def get_updates(offset=None, timeout=30):
+    params = {
+        "timeout": timeout,
+        "allowed_updates": ["message", "callback_query"],
+    }
+    if offset:
+        params["offset"] = offset
+    try:
+        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=timeout+5)
+        return r.json().get("result", [])
+    except: return []
+
+
+# ══════════════════════════════════════════════════════════════
+# MENUS
+# ══════════════════════════════════════════════════════════════
+
+def show_main_menu(chat_id, text="Chọn chức năng:"):
+    send_keyboard(chat_id, f"🤖 *Stock Bot v4.0*\n{text}", [
+        [("📊 Tra cứu cổ phiếu",  "menu:lookup"),
+         ("📁 Tư vấn danh mục",    "menu:portfolio")],
+        [("🎯 Khuyến nghị hôm nay","menu:recommend")],
+        [("📈 VN-Index",           "menu:vnindex"),
+         ("🏭 Dòng tiền ngành",    "menu:sectors")],
+        [("ℹ️ Hướng dẫn",          "menu:help")],
+    ])
+
+def show_portfolio_menu(chat_id):
+    summary = pf.format_watchlist_summary(chat_id)
+    send_keyboard(chat_id, summary, [
+        [("➕ Thêm mã",           "pf:add"),
+         ("➖ Xóa mã",            "pf:remove_list")],
+        [("🔍 Phân tích danh mục","pf:analyze"),
+         ("🔔 Alert danh mục",    "pf:alert")],
+        [("📊 Tóm tắt",           "pf:summary"),
+         ("⚙️ Quản lý danh mục",  "pf:manage")],
+        [("🔙 Menu chính",         "menu:main")],
+    ])
+
+def show_watchlist_mgmt(chat_id):
+    wls  = pf.get_watchlists(chat_id)
+    act  = pf.get_active_wl_id(chat_id)
+    lines = ["⚙️ *Quản lý danh mục*\n"]
+    buttons = []
+    for wl_id, wl in wls.items():
+        marker = "✅ " if wl_id == act else ""
+        count  = len(wl.get("symbols", {}))
+        lines.append(f"{marker}*{wl['name']}* ({count} mã)")
+        if wl_id != act:
+            buttons.append([(f"▶️ Chọn: {wl['name']}", f"pf:sel_wl:{wl_id}")])
+        buttons.append([(f"🗑️ Xóa: {wl['name']}", f"pf:del_wl:{wl_id}")])
+    buttons.append([("➕ Tạo danh mục mới", "pf:create_wl")])
+    buttons.append([("🔙 Quay lại",          "pf:back")])
+    send_keyboard(chat_id, "\n".join(lines), buttons)
+
+def show_remove_list(chat_id):
+    """Hiển thị danh sách mã để xóa"""
+    syms = pf.get_symbols(chat_id)
+    if not syms:
+        send_message(chat_id, "📋 Danh mục trống, không có gì để xóa.")
+        show_portfolio_menu(chat_id)
+        return
+    buttons = []
+    for sym in syms:
+        cp  = syms[sym].get("cost_price", 0)
+        qty = syms[sym].get("qty", 0)
+        label = sym
+        if cp > 0: label += f" | vốn {pf.fmt_price(cp)}"
+        if qty > 0: label += f" | {qty:,}CP"
+        buttons.append([(f"🗑️ {label}", f"pf:del_sym:{sym}")])
+    buttons.append([("🔙 Quay lại", "pf:back")])
+    send_keyboard(chat_id, "➖ *Chọn mã cần xóa:*", buttons)
+
+
+# ══════════════════════════════════════════════════════════════
+# ALERT integration
+# ══════════════════════════════════════════════════════════════
+ALERT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.py")
+
 def handle_alert_scan(chat_id, manual_chat_id=None):
-    """Kích hoạt alert scan từ Telegram /alert command."""
     cid = manual_chat_id or chat_id
     send_message(cid, "🔔 Đang quét danh mục để tìm tín hiệu mới...")
     try:
@@ -475,7 +610,6 @@ def handle_alert_scan(chat_id, manual_chat_id=None):
         send_message(cid, f"❌ Không chạy được alert: {e}")
 
 def handle_alert_summary(chat_id):
-    """Gửi tóm tắt toàn bộ danh mục."""
     send_message(chat_id, "📊 Đang tổng hợp danh mục...")
     try:
         subprocess.run(
@@ -486,33 +620,254 @@ def handle_alert_summary(chat_id):
         send_message(chat_id, f"❌ Lỗi: {e}")
 
 
-# ── Handlers ──
+# ══════════════════════════════════════════════════════════════
+# CALLBACK QUERY HANDLER
+# ══════════════════════════════════════════════════════════════
+
+def handle_callback_query(cbq):
+    """Xử lý tất cả inline button clicks"""
+    cqid    = cbq["id"]
+    chat_id = str(cbq["from"]["id"])
+    data    = cbq.get("data", "")
+    answer_callback(cqid)
+
+    parts = data.split(":")
+
+    # ── MAIN MENU ──
+    if parts[0] == "menu":
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "main":
+            clear_state(chat_id)
+            show_main_menu(chat_id)
+        elif action == "portfolio":
+            clear_state(chat_id)
+            show_portfolio_menu(chat_id)
+        elif action == "lookup":
+            clear_state(chat_id)
+            set_state(chat_id, "lookup_sym")
+            send_message(chat_id, "📊 Nhập mã cổ phiếu cần tra cứu:\n_(VD: HPG, FPT, VCB)_")
+        elif action == "recommend":
+            send_typing(chat_id)
+            resp = ask_claude(
+                "Hãy đề xuất 3 cổ phiếu Việt Nam đáng chú ý nhất hôm nay, "
+                "mỗi cái 1-2 câu lý do cụ thể, thực tế."
+            )
+            send_message(chat_id, f"🎯 *Khuyến nghị hôm nay:*\n\n{resp}")
+            show_main_menu(chat_id)
+        elif action == "vnindex":
+            handle_vnindex(chat_id)
+        elif action == "sectors":
+            handle_sectors(chat_id)
+        elif action == "help":
+            handle_help(chat_id)
+        return
+
+    # ── PORTFOLIO ──
+    if parts[0] == "pf":
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "back":
+            clear_state(chat_id)
+            show_portfolio_menu(chat_id)
+
+        elif action == "add":
+            clear_state(chat_id)
+            set_state(chat_id, "pf_add_sym")
+            send_message(chat_id,
+                "➕ *Thêm mã vào danh mục*\n\n"
+                "Nhập mã cổ phiếu:\n_(VD: HPG — mỗi lần thêm 1 mã để nhập giá vốn)_"
+            )
+
+        elif action == "remove_list":
+            clear_state(chat_id)
+            show_remove_list(chat_id)
+
+        elif action == "del_sym":
+            sym = parts[2] if len(parts) > 2 else ""
+            if sym:
+                ok = pf.remove_symbol(chat_id, sym)
+                if ok:
+                    send_message(chat_id, f"✅ Đã xóa *{sym}* khỏi danh mục")
+                else:
+                    send_message(chat_id, f"❌ Không tìm thấy {sym}")
+            show_portfolio_menu(chat_id)
+
+        elif action == "analyze":
+            clear_state(chat_id)
+            send_message(chat_id, "⏳ Đang phân tích danh mục...\n_(có thể mất 30-60 giây)_")
+            threading.Thread(
+                target=_run_analysis,
+                args=(chat_id,),
+                daemon=True
+            ).start()
+
+        elif action == "alert":
+            threading.Thread(
+                target=handle_alert_scan,
+                args=(chat_id,),
+                daemon=True
+            ).start()
+
+        elif action == "summary":
+            threading.Thread(
+                target=handle_alert_summary,
+                args=(chat_id,),
+                daemon=True
+            ).start()
+
+        elif action == "manage":
+            clear_state(chat_id)
+            show_watchlist_mgmt(chat_id)
+
+        elif action == "create_wl":
+            set_state(chat_id, "pf_create_wl")
+            send_message(chat_id, "📁 Nhập tên danh mục mới:\n_(VD: Dài hạn, Swing, Đầu cơ)_")
+
+        elif action == "del_wl":
+            wl_id = parts[2] if len(parts) > 2 else ""
+            if wl_id:
+                ok, msg = pf.delete_watchlist(chat_id, wl_id)
+                if ok:
+                    send_message(chat_id, f"🗑️ Đã xóa danh mục *{msg}*")
+                else:
+                    send_message(chat_id, f"❌ {msg}")
+            show_watchlist_mgmt(chat_id)
+
+        elif action == "sel_wl":
+            wl_id = parts[2] if len(parts) > 2 else ""
+            if wl_id and pf.set_active_wl(chat_id, wl_id):
+                wls  = pf.get_watchlists(chat_id)
+                name = wls.get(wl_id, {}).get("name", wl_id)
+                send_message(chat_id, f"✅ Đang xem: *{name}*")
+            show_portfolio_menu(chat_id)
+
+        return
+
+
+def _run_analysis(chat_id):
+    result = pf.format_analysis_result(chat_id)
+    send_message(chat_id, result)
+    show_portfolio_menu(chat_id)
+
+
+# ══════════════════════════════════════════════════════════════
+# STATE-AWARE TEXT HANDLER
+# ══════════════════════════════════════════════════════════════
+
+def process_state_input(chat_id, text):
+    """Xử lý input khi đang trong 1 flow có state.
+    Trả về True nếu đã xử lý, False nếu không có state."""
+    state = get_state(chat_id)
+    step  = state.get("step")
+    data  = state.get("data", {})
+
+    if not step:
+        return False
+
+    # ── LOOKUP ──
+    if step == "lookup_sym":
+        sym = text.strip().upper()
+        if re.match(r'^[A-Z]{2,4}[0-9]?$', sym):
+            clear_state(chat_id)
+            handle_stock_combo(chat_id, sym)
+        else:
+            send_message(chat_id, "❓ Mã không hợp lệ. VD: HPG, FPT, VCB")
+        return True
+
+    # ── ADD SYMBOL: bước 1 — nhập tên mã ──
+    if step == "pf_add_sym":
+        sym = text.strip().upper()
+        if not re.match(r'^[A-Z]{2,4}[0-9]?$', sym):
+            send_message(chat_id, "❓ Mã không hợp lệ. Nhập lại (VD: HPG):")
+            return True
+        set_state(chat_id, "pf_add_cost", {"sym": sym})
+        send_message(chat_id,
+            f"💰 Nhập *giá vốn {sym}* (đơn vị: đồng/CP)\n"
+            f"VD: `25500` hoặc `0` nếu không muốn nhập"
+        )
+        return True
+
+    # ── ADD SYMBOL: bước 2 — nhập giá vốn ──
+    if step == "pf_add_cost":
+        sym = data.get("sym", "")
+        try:
+            cost = float(text.strip().replace(",", "").replace(".", ""))
+            if cost < 0: raise ValueError
+        except ValueError:
+            send_message(chat_id, "❓ Nhập số hợp lệ (VD: 25500 hoặc 0):")
+            return True
+        set_state(chat_id, "pf_add_qty", {"sym": sym, "cost": cost})
+        send_message(chat_id,
+            f"📦 Nhập *khối lượng {sym}* (số cổ phiếu)\n"
+            f"VD: `1000` hoặc `0` nếu không muốn nhập"
+        )
+        return True
+
+    # ── ADD SYMBOL: bước 3 — nhập khối lượng & lưu ──
+    if step == "pf_add_qty":
+        sym  = data.get("sym", "")
+        cost = data.get("cost", 0)
+        try:
+            qty = int(text.strip().replace(",", ""))
+            if qty < 0: raise ValueError
+        except ValueError:
+            send_message(chat_id, "❓ Nhập số nguyên hợp lệ (VD: 1000 hoặc 0):")
+            return True
+
+        ok, msg = pf.add_symbol(chat_id, sym, cost_price=cost, qty=qty)
+        clear_state(chat_id)
+        if ok:
+            action_txt = "Đã cập nhật" if msg == "updated" else "Đã thêm"
+            cost_txt   = f" | Giá vốn: *{pf.fmt_price(cost)}*" if cost > 0 else ""
+            qty_txt    = f" | KL: *{qty:,} CP*" if qty > 0 else ""
+            send_message(chat_id, f"✅ {action_txt} *{sym}*{cost_txt}{qty_txt}")
+        else:
+            send_message(chat_id, f"❌ {msg}")
+
+        # Hỏi có thêm mã nữa không
+        send_keyboard(chat_id, "Tiếp tục?", [
+            [("➕ Thêm mã khác", "pf:add"),
+             ("📋 Xem danh mục", "pf:back")],
+        ])
+        return True
+
+    # ── CREATE WATCHLIST ──
+    if step == "pf_create_wl":
+        name = text.strip()
+        if len(name) < 1 or len(name) > 30:
+            send_message(chat_id, "❓ Tên danh mục 1-30 ký tự. Nhập lại:")
+            return True
+        ok, result = pf.create_watchlist(chat_id, name)
+        clear_state(chat_id)
+        if ok:
+            send_message(chat_id, f"✅ Đã tạo danh mục *{name}*")
+        else:
+            send_message(chat_id, f"❌ {result}")
+        show_portfolio_menu(chat_id)
+        return True
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════════
+# HANDLERS (kept from v4)
+# ══════════════════════════════════════════════════════════════
+
 def handle_help(chat_id):
     msg = (
-        "🤖 *Stock Bot — Hướng dẫn sử dụng*\n"
+        "🤖 *Stock Bot v4.0 — Hướng dẫn*\n"
         "─────────────────────\n"
-        "💬 *Chat tự do với mã CK:*\n"
-        "  `PVT` hoặc `giá FPT` hoặc `phân tích MBB`\n"
-        "  → Tự động phân tích 5 Combo chỉ báo\n\n"
-        "📌 *Lệnh có sẵn:*\n"
-        "  `/vnindex` — VN-Index hiện tại\n"
-        "  `/sectors` — Dòng tiền 7 ngành\n"
-        "  `/macro`   — Vàng XAUUSD\n"
-        "  `/news`    — Tin tức chứng khoán\n\n"
-        "🔍 *5 Combo được tính tự động:*\n"
-        "  C1: EMA Stack + MACD + Volume\n"
-        "  C2: VWAP + OBV + Bollinger Bands\n"
-        "  C3: SuperTrend + Stoch RSI + CMF\n"
-        "  C4: MACD Cross + RSI + MFI\n"
-        "  C5: Multi-TF Trend Strength\n\n"
-        "⚡ Score ≥70 = Mua mạnh | 55-69 = Mua | <45 = Tránh\n\n"
-        "🔔 *Alert v4.0:*\n"
-        "  `/alert`    — quét tín hiệu thay đổi\n"
-        "  `/summary`  — tóm tắt toàn danh mục\n\n"
-        "💼 *Danh mục (MVP2):*\n"
-        "  `thêm HPG FPT` — thêm vào watchlist\n"
-        "  `xóa HPG`      — xóa khỏi watchlist\n"
-        "  `danh mục`     — xem danh sách"
+        "📌 *Menu chính:* gõ `/menu` hoặc `/start`\n\n"
+        "📊 *Tra cứu cổ phiếu:*\n"
+        "  Gõ thẳng mã: `HPG`, `FPT`, `VCB`\n"
+        "  Hoặc: `phân tích HPG`\n\n"
+        "📁 *Danh mục:*\n"
+        "  → Chọn *Tư vấn danh mục* từ menu\n"
+        "  Hỗ trợ: thêm/xóa mã, giá vốn, KL,\n"
+        "  phân tích P&L, alert tín hiệu\n\n"
+        "⚡ *Score:* ≥70 Mua mạnh | 55-69 Mua | <45 Tránh\n"
+        "💰 *Kelly:* STRONG → 5-8% vốn | NORMAL → 3-5%\n\n"
+        "🔔 *Alert tự động:* 9:30 | 12:00 | 15:15 | 20:00"
     )
     send_message(chat_id, msg)
 
@@ -524,14 +879,12 @@ def handle_vnindex(chat_id):
         return
     arrow = "📈" if d.get("change", 0) >= 0 else "📉"
     sign  = "+" if d.get("change", 0) >= 0 else ""
-    msg = (
+    send_message(chat_id,
         f"{arrow} *VN-Index*\n"
         f"Điểm: *{d['close']:,.2f}*\n"
-        f"Thay đổi: *{sign}{d.get('change_pct', 0):.2f}%* ({sign}{d.get('change',0):.2f} điểm)\n"
-        f"Open: {d.get('open',0):,.2f}\n"
+        f"Thay đổi: *{sign}{d.get('change_pct', 0):.2f}%*\n"
         f"Ngày: {d.get('date','')}"
     )
-    send_message(chat_id, msg)
 
 def handle_sectors(chat_id):
     send_typing(chat_id)
@@ -542,11 +895,11 @@ def handle_sectors(chat_id):
     lines = ["📊 *Dòng tiền ngành hôm nay:*\n"]
     for s in d.get("sectors", []):
         sig_emoji = {"DONG TIEN VAO": "🟢", "DONG TIEN RA": "🔴"}.get(s["signal"], "⚪")
-        pct = s['avg_change_pct']
+        pct  = s['avg_change_pct']
         sign = "+" if pct >= 0 else ""
         lines.append(f"{sig_emoji} *{s['sector']}*: {sign}{pct:.1f}%")
-    lines.append(f"\n_Cập nhật: {d.get('updated_at','')}_")
     send_message(chat_id, "\n".join(lines))
+
 
 def handle_stock_combo(chat_id, symbol: str):
     """Handler chính — phân tích đầy đủ 5 combo"""
@@ -597,11 +950,14 @@ def handle_free_chat(chat_id, text: str):
     response = ask_claude(text)
     send_message(chat_id, response)
 
-# ── Main dispatcher ──
+
+# ══════════════════════════════════════════════════════════════
+# MAIN DISPATCHER
+# ══════════════════════════════════════════════════════════════
+
 def process_message(msg):
     chat_id = str(msg["chat"]["id"])
     text    = msg.get("text", "").strip()
-
     if not text:
         return
 
@@ -611,12 +967,21 @@ def process_message(msg):
     text_lower = text.lower()
     text_upper = unicodedata.normalize("NFC", text.upper())
 
-    # ── Lệnh cụ thể ──
-    if text_lower in ["/start", "/help", "help", "giup", "huong dan"]:
+    # ── 1. State machine — xử lý input đang trong flow ──
+    if process_state_input(chat_id, text):
+        return
+
+    # ── 2. Lệnh menu ──
+    if text_lower in ["/start", "/menu", "menu", "start"]:
+        clear_state(chat_id)
+        show_main_menu(chat_id)
+        return
+
+    if text_lower in ["/help", "help", "giup", "huong dan"]:
         handle_help(chat_id)
         return
 
-    if text_lower == "/vnindex" or text_lower == "vnindex":
+    if text_lower in ["/vnindex", "vnindex"]:
         handle_vnindex(chat_id)
         return
 
@@ -624,133 +989,74 @@ def process_message(msg):
         handle_sectors(chat_id)
         return
 
-    if text_lower in ["/alert", "alert", "quet", "quét", "quet tin hieu", "quét tín hiệu"]:
+    if text_lower in ["/alert", "alert", "quet", "quét"]:
         threading.Thread(target=handle_alert_scan, args=(chat_id,), daemon=True).start()
         return
 
-    if text_lower in ["/summary", "summary", "tom tat", "tóm tắt", "tong hop danh muc"]:
+    if text_lower in ["/summary", "summary", "tom tat", "tóm tắt"]:
         threading.Thread(target=handle_alert_summary, args=(chat_id,), daemon=True).start()
         return
 
     if text_lower.startswith("/macro") or text_lower == "macro":
-        send_typing(chat_id)
         d = api_get("/macro")
         if "XAUUSD" in d:
             send_message(chat_id, f"🥇 Vàng XAUUSD: *${d['XAUUSD']['price']:,.2f}*")
-        else:
-            send_message(chat_id, "❌ Không lấy được macro data")
         return
 
     if text_lower.startswith("/news") or text_lower == "news":
-        send_typing(chat_id)
         d = api_get("/news")
         if "news" in d:
             lines = ["📰 *Tin tức mới nhất:*\n"]
             for a in d["news"]:
                 lines.append(f"• {a['title']}\n  _{a['source']} | {a['published']}_")
             send_message(chat_id, "\n".join(lines))
-        else:
-            send_message(chat_id, "❌ Không lấy được tin tức")
         return
 
-    # ── Portfolio commands (MVP2) ──
-    def _pf_send(msg_text): send_message(chat_id, msg_text)
-
-    # Thêm vào danh mục
-    if any(kw in text_lower for kw in ["thêm", "them ", "theo dõi"]):
-        symbols = re.findall(r'([A-Z]{2,4})', text_upper)
-        noise = {"NO","OK","VN","TK","TP","SL","GD","AI","THEM","ADD","BOV","VAO","THEO","DOI","THANH"}
-        syms = [s for s in symbols if s not in noise and len(s) >= 2]
-        if syms:
-            portfolio_module.handle_add(chat_id, syms, _pf_send)
-            return
-
-    # Xóa khỏi danh mục
-    if any(kw in text_lower for kw in ["xóa", "xoa ", "loại ", "loai "]):
-        symbols = re.findall(r'([A-Z]{2,4})', text_upper)
-        noise = {"NO","OK","VN","XOA","LOAI","REMOVE","DELETE"}
-        syms = [s for s in symbols if s not in noise and len(s) >= 2]
-        if syms:
-            portfolio_module.handle_remove(chat_id, syms, _pf_send)
-            return
-
-    # Xem danh mục
-    if any(kw in text_lower for kw in [
-        "danh mục của tôi", "danh muc cua toi", "xem danh mục", "xem danh muc",
-        "/dm", "watchlist", "đang theo dõi", "dang theo doi", "/portfolio"
-    ]):
-        portfolio_module.handle_list(chat_id, [], _pf_send)
-        return
-
-    # Phân tích toàn bộ danh mục
-    if any(kw in text_lower for kw in [
-        "phân tích danh mục", "phan tich danh muc", "scan danh mục",
-        "quét danh mục", "quet danh muc", "phân tích tất cả",
-        "check danh mục", "danh mục hôm nay"
-    ]):
-        threading.Thread(
-            target=portfolio_module.handle_analyze_all,
-            args=(chat_id, [], _pf_send),
-            daemon=True
-        ).start()
-        return
-
-    # ── Auto-detect mã cổ phiếu ──
-    # Trường hợp 1: Nhắn đúng mã (1-2 từ viết hoa)
+    # ── 3. Auto-detect mã cổ phiếu ──
     words = text.split()
     if 1 <= len(words) <= 2:
         candidate = words[0].upper()
         if re.match(r'^[A-Z]{2,4}[0-9]?[A-Z]?$', candidate):
-            if candidate in KNOWN_SYMBOLS or len(candidate) in [2,3]:
+            if candidate in KNOWN_SYMBOLS or len(candidate) in [2, 3]:
                 if candidate not in {"NO", "OK", "BN", "TK", "TP", "SL", "GD", "KQ"}:
                     handle_stock_combo(chat_id, candidate)
                     return
 
-    # Trường hợp 2: Extract từ câu dài
     symbol = extract_symbol(text)
     if symbol and symbol not in {"VN", "OK", "NO", "THE"}:
-        # Double-check: không phải lệnh thông thường
         if not any(text_lower.startswith(cmd) for cmd in ["/phan", "/khuyen", "khuyen nghi"]):
             handle_stock_combo(chat_id, symbol)
             return
 
-    # Trường hợp 3: /phan tich hoặc phan tich [SYMBOL]
     phan_match = re.search(r'(?:phan tich|phân tích|analyze|check)\s+([A-Z]{2,4})', text_upper)
     if phan_match:
         handle_stock_combo(chat_id, phan_match.group(1))
         return
 
-    # Trường hợp 4: khuyen nghi / khuyến nghị
-    if any(kw in text_lower for kw in ["khuyen nghi", "khuyến nghị", "nen mua gi", "nên mua gì", "co phieu tot"]):
+    if any(kw in text_lower for kw in ["khuyen nghi", "khuyến nghị", "nen mua gi", "nên mua gì"]):
         send_typing(chat_id)
-        prompt = (
+        resp = ask_claude(
             f"Câu hỏi từ nhà đầu tư: {text}\n\n"
-            "Hãy trả lời ngắn gọn và thực tế về thị trường chứng khoán Việt Nam hiện tại, "
-            "đề xuất 2-3 cổ phiếu đáng chú ý với lý do cụ thể."
+            "Đề xuất 2-3 cổ phiếu đáng chú ý với lý do cụ thể."
         )
-        response = ask_claude(prompt)
-        send_message(chat_id, f"💡 *Gợi ý đầu tư:*\n\n{response}")
+        send_message(chat_id, f"💡 *Gợi ý đầu tư:*\n\n{resp}")
         return
 
-    # Trường hợp 5: Chat tự do → Claude trả lời
-    handle_free_chat(chat_id, text)
+    # ── 4. Fallback: show menu thay vì free chat ──
+    show_main_menu(chat_id, "Không hiểu lệnh. Chọn chức năng:")
 
-# ── Bot loop ──
+
+# ══════════════════════════════════════════════════════════════
+# BOT MAIN LOOP
+# ══════════════════════════════════════════════════════════════
+
 def main():
-    log.info("🤖 Stock Bot khởi động — Combo Engine v2")
-
-    # Xóa webhook cũ
+    log.info("🤖 Stock Bot v5 khởi động — Menu-driven + Portfolio v5")
     try:
-        r = requests.post(f"{TELEGRAM_API}/deleteWebhook", timeout=10)
-        log.info(f"Webhook deleted: {r.json()}")
+        requests.post(f"{TELEGRAM_API}/deleteWebhook", timeout=10)
     except: pass
 
-    send_message(CHAT_ID,
-        "🤖 *Bot v4.0 khởi động!* (Dynamic Weights | Kelly | Alert)\n\n"
-        "Chat bất kỳ mã CK để phân tích:\n"
-        "`PVT` `FPT` `MBB` `TCB` ...\n\n"
-        "Gõ /help để xem hướng dẫn đầy đủ"
-    )
+    show_main_menu(CHAT_ID)
 
     offset = None
     while True:
@@ -758,14 +1064,19 @@ def main():
             updates = get_updates(offset=offset, timeout=30)
             for upd in updates:
                 offset = upd["update_id"] + 1
-                msg = upd.get("message")
-                if msg and "text" in msg:
+                # Callback query (button click)
+                if "callback_query" in upd:
                     try:
-                        process_message(msg)
+                        handle_callback_query(upd["callback_query"])
                     except Exception as e:
-                        log.error(f"process_message error: {e}")
+                        log.error(f"callback error: {e}")
+                # Text message
+                elif "message" in upd and "text" in upd["message"]:
+                    try:
+                        process_message(upd["message"])
+                    except Exception as e:
+                        log.error(f"message error: {e}")
         except KeyboardInterrupt:
-            log.info("Bot stopped")
             break
         except Exception as e:
             log.error(f"Main loop error: {e}")
