@@ -84,17 +84,28 @@ INTENT_REGISTRY = {
         "symbol_required": False,
     },
 
-    # ── MVP3: Alert (placeholder — chưa implement) ──
-    "alert.set": {
+    # ── MVP3: Alert — scan tín hiệu thay đổi ──
+    "alert.scan": {
         "module":      "alert",
-        "handler":     "handle_set_alert",
-        "description": "Đặt cảnh báo giá hoặc lịch nhắc",
+        "handler":     "handle_alert_scan",
+        "description": "Quét toàn bộ watchlist tìm tín hiệu thay đổi",
         "keywords": [
-            "cảnh báo", "canh bao", "alert", "nhắc", "nhac",
-            "thông báo khi", "thong bao khi",
+            "alert", "quét", "quet", "scan", "tín hiệu mới",
+            "tin hieu moi", "thông báo", "thong bao",
         ],
         "symbol_required": False,
-        "coming_soon": True,
+        "coming_soon": False,
+    },
+    "alert.summary": {
+        "module":      "alert",
+        "handler":     "handle_alert_summary",
+        "description": "Tóm tắt toàn bộ danh mục theo dõi",
+        "keywords": [
+            "tóm tắt", "tom tat", "summary", "tổng hợp",
+            "tong hop", "tổng quan danh mục",
+        ],
+        "symbol_required": False,
+        "coming_soon": False,
     },
 }
 
@@ -140,8 +151,8 @@ def keyword_match(text: str) -> dict | None:
     priority_order = [
         "portfolio.add", "portfolio.remove",
         "portfolio.list", "portfolio.analyze_all",
+        "alert.scan", "alert.summary",
         "trading.analyze", "trading.price",
-        "alert.set",
     ]
 
     for intent_key in priority_order:
