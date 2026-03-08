@@ -1571,5 +1571,55 @@ def get_news():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ══════════════════════════════════════════════════════════════
+# AUTO DEPLOY — GitHub Webhook
+# ══════════════════════════════════════════════════════════════
+import subprocess, hmac, hashlib
+from flask import request as flask_request
+
+@app.route("/deploy", methods=["POST"])
+def deploy():
+    """GitHub Webhook endpoint — tự động pull + restart khi có push mới"""
+    deploy_secret = os.environ.get("DEPLOY_SECRET", "")
+    if not deploy_secret:
+        return jsonify({"error": "DEPLOY_SECRET chưa được cấu hình"}), 500
+
+    # Xác thực chữ ký từ GitHub
+    sig_header = flask_request.headers.get("X-Hub-Signature-256", "")
+    body = flask_request.get_data()
+    expected = "sha256=" + hmac.new(
+        deploy_secret.encode(), body, hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(sig_header, expected):
+        return jsonify({"error": "Unauthorized — sai secret"}), 401
+
+    # Chỉ deploy khi push vào branch main
+    payload = flask_request.get_json(silent=True) or {}
+    ref = payload.get("ref", "")
+    if ref and ref != "refs/heads/main":
+        return jsonify({"status": "ignored", "ref": ref}), 200
+
+    # Pull code mới và restart cả 2 services
+    result = subprocess.run(
+        "cd /root/stock-api && git pull origin main && "
+        "systemctl restart stockapi stockbot",
+        shell=True, capture_output=True, text=True, timeout=60
+    )
+
+    if result.returncode == 0:
+        return jsonify({
+            "status":  "✅ Deploy thành công",
+            "output":  result.stdout.strip()[-500:],
+            "ref":     ref,
+        }), 200
+    else:
+        return jsonify({
+            "status": "❌ Deploy thất bại",
+            "error":  result.stderr.strip()[-500:],
+            "output": result.stdout.strip()[-200:],
+        }), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
