@@ -328,26 +328,36 @@ def claude_with_combo(symbol: str, d: dict) -> str:
     cf_lines = "\n".join(
         f"  {v}" for v in cf.get("signals", {}).values()
     )
+
+    # Truyền đầy đủ giá tham chiếu để Claude output đúng mức giá
     prompt = (
         f"Phân tích dài hạn {symbol} ngày {d['date']}:\n"
-        f"- Giá: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n\n"
-        f"[MTF SCORE: {mtf.get('mtf_total',0)}/100]\n"
-        f"- Quyết định MTF: {mtf.get('decision_vi','')}\n"
+        f"- Giá hiện tại: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n"
+        f"- EMA9/20/50: {fmt_price(d['ema9'])}/{fmt_price(d['ema20'])}/{fmt_price(d['ema50'])}\n"
+        f"- BB Upper/Lower: {fmt_price(d.get('bb_upper'))}/{fmt_price(d.get('bb_lower'))}\n\n"
+        f"[MTF: {mtf.get('mtf_total',0)}/100 — {mtf.get('decision_vi','')}]\n"
         f"- Monthly {mtf.get('monthly_score',0)}: {mtf.get('monthly_note','')}\n"
         f"- Weekly  {mtf.get('weekly_score',0)}: {mtf.get('weekly_note','')}\n"
         f"- Daily   {d['total_score']}: {tp.get('decision_vi','')}\n"
-        f"- DCA cho phép: {mtf.get('dca_note','')}\n"
         f"{('- ⚠️ ' + mtf.get('monthly_warning','')) if mtf.get('monthly_warning') else ''}\n\n"
         f"[CONFLUENCE: {cf.get('score',0)}/40 — {cf.get('level','')}]\n"
         f"{cf_lines}\n\n"
-        f"[KỸ THUẬT DAILY]\n"
-        f"- ST: {d['supertrend']} | EMA9/20/50: {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f}\n"
-        f"- RSI: {d['rsi14']:.1f} | MACD: {d['macd']:+.3f} | OBV: {d['obv_trend']} | CMF: {d['cmf20']:+.3f}\n"
-        f"- Vùng DCA: {tp.get('dca_zone1','')} | {tp.get('dca_zone2','')} | {tp.get('dca_zone3','')}\n"
+        f"[KỸ THUẬT]\n"
+        f"- ST: {d['supertrend']} | RSI: {d['rsi14']:.1f} | MACD: {d['macd']:+.3f} | OBV: {d['obv_trend']}\n"
         f"- Tín hiệu thoát ({tp.get('reversal_count',0)}/5):\n{reversal_lines}\n\n"
-        f"Phân tích 4-5 câu theo góc nhìn dài hạn: xác nhận quyết định MTF, "
-        f"đánh giá confluence hiện tại có đủ mạnh để DCA không, "
-        f"và 1 rủi ro dài hạn quan trọng nhất cần theo dõi."
+        f"[VÙNG GIÁ THAM CHIẾU]\n"
+        f"- DCA Tầng 1 (EMA20): {tp.get('dca_zone1','')}\n"
+        f"- DCA Tầng 2 (EMA50): {tp.get('dca_zone2','')}\n"
+        f"- DCA Tầng 3 (BB Low): {tp.get('dca_zone3','')}\n"
+        f"- Hỗ trợ: {fmt_price(tp.get('support_1'))} / {fmt_price(tp.get('support_2'))} / {fmt_price(tp.get('support_3'))}\n"
+        f"- Kháng cự: {fmt_price(tp.get('resistance'))}\n\n"
+        f"Yêu cầu output CHÍNH XÁC theo format sau (không thêm bớt):\n"
+        f"Quyết định: [MUA THÊM 🟢 / NẮM GIỮ ⚪ / THOÁT 🔴]\n"
+        f"📌 Giá mua thêm (DCA): [vùng giá cụ thể từ dữ liệu trên]\n"
+        f"📌 Giá vào lệnh mới: [vùng giá cụ thể nếu chưa có vị thế]\n"
+        f"📌 Chốt lời một phần: [mức kháng cự gần nhất hoặc 'Chưa — tiếp tục giữ']\n"
+        f"📌 Thoát lệnh khi: [điều kiện chỉ báo cụ thể, KHÔNG dùng giá cố định]\n"
+        f"[1-2 câu nhận định ngắn gọn lý do và rủi ro chính]"
     )
     return ask_claude(prompt)
 
