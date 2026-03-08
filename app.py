@@ -591,6 +591,14 @@ def calc_smart_dca(closes, highs, lows, volumes, df_weekly,
     zone_high   = round(max(prices) * 1.005, 2)
     dist_pct    = round((zone_center - current_price) / current_price * 100, 1)
 
+    # Format giá đúng đơn vị — nhân 1000 nếu < 1000 (KBS trả về đơn vị nghìn đồng)
+    def fmt_zone_price(p):
+        if p < 1000:
+            return f"{p*1000:,.0f}đ"
+        return f"{p:,.0f}đ"
+
+    zone_str = f"{fmt_zone_price(zone_low)}–{fmt_zone_price(zone_high)}"
+
     # Stars rating
     n_sources = len(best)
     if n_sources >= 4:   stars = "⭐⭐⭐⭐"
@@ -601,13 +609,13 @@ def calc_smart_dca(closes, highs, lows, volumes, df_weekly,
     # ── Breakout entry nếu zone xa >8% ──
     breakout_entry = None
     if dist_pct < -8:
-        # Mức breakout = đỉnh gần nhất + 0.5%
         recent_high = max(highs[-10:])
         breakout_price = round(recent_high * 1.005, 2)
         if breakout_price > current_price:
             breakout_entry = {
-                "price":  breakout_price,
-                "note":   f"Mua breakout khi vượt {breakout_price:,.2f} kèm vol > 1.5× TB20",
+                "price":      breakout_price,
+                "price_fmt":  fmt_zone_price(breakout_price),
+                "note":       f"Mua breakout khi vượt {fmt_zone_price(breakout_price)} kèm vol > 1.5× TB20",
             }
 
     return {
@@ -616,7 +624,7 @@ def calc_smart_dca(closes, highs, lows, volumes, df_weekly,
         "adx":                adx_val,
         "best_zone_low":      zone_low,
         "best_zone_high":     zone_high,
-        "best_zone_str":      f"{zone_low:,.2f}–{zone_high:,.2f}",
+        "best_zone_str":      zone_str,
         "best_zone_sources":  sources,
         "best_zone_stars":    stars,
         "best_zone_dist_pct": dist_pct,
@@ -1254,23 +1262,37 @@ def run_combo_analysis(symbol):
     dist_ema50_pct = round((latest_close - ema50) / ema50 * 100, 1)
 
     # ── 5. Vùng hỗ trợ & kháng cự động ──
-    # Hỗ trợ = mức GIÁ DƯỚI giá hiện tại; kháng cự = mức TRÊN giá hiện tại
     price = latest_close
-    candidates = sorted(set([
+    # Tính thêm Fib extension và swing high cho kháng cự xa hơn
+    swing_high_20 = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+    swing_high_60 = max(highs[-60:]) if len(highs) >= 60 else max(highs)
+    fib_data = calc_fibonacci(closes, highs, lows, 60)
+    fib_236  = fib_data["fib_236"] if fib_data else None
+
+    resist_candidates = sorted(set(filter(None, [
+        round(bb_upper, 2) if bb_upper else None,
+        round(swing_high_20, 2),
+        round(swing_high_60, 2),
+        round(fib_236, 2) if fib_236 else None,
+        round(ema9, 2) if ema9 > price else None,
+        round(ema20, 2) if ema20 > price else None,
+    ])))
+    support_candidates = sorted(set(filter(None, [
         round(ema20, 2),
         round(ema50, 2),
-        round(st_val, 2) if st_val else round(ema20 * 0.97, 2),
-        round(bb_lower, 2) if bb_lower else round(ema50 * 0.95, 2),
-        round(bb_upper, 2) if bb_upper else round(price * 1.05, 2),
-        round(bb_mid, 2)   if bb_mid   else round(price * 1.02, 2),
-    ]))
-    supports    = sorted([x for x in candidates if x < price * 0.999], reverse=True)  # gần nhất trước
-    resistances = sorted([x for x in candidates if x > price * 1.001])                # gần nhất trước
+        round(st_val, 2) if st_val else None,
+        round(bb_lower, 2) if bb_lower else None,
+        round(bb_mid, 2) if bb_mid else None,
+    ])))
 
-    support_1   = supports[0]    if len(supports) > 0 else round(price * 0.95, 2)
-    support_2   = supports[1]    if len(supports) > 1 else round(price * 0.90, 2)
-    support_3   = supports[2]    if len(supports) > 2 else round(price * 0.85, 2)
-    resistance  = resistances[0] if len(resistances) > 0 else round(price * 1.05, 2)
+    # Hỗ trợ: dưới giá, kháng cự: trên giá ít nhất 0.5% (tránh quá gần)
+    supports    = sorted([x for x in support_candidates if x < price * 0.999], reverse=True)
+    resistances = sorted([x for x in resist_candidates  if x > price * 1.005])
+
+    support_1  = supports[0]    if len(supports) > 0 else round(price * 0.95, 2)
+    support_2  = supports[1]    if len(supports) > 1 else round(price * 0.90, 2)
+    support_3  = supports[2]    if len(supports) > 2 else round(price * 0.85, 2)
+    resistance = resistances[0] if len(resistances) > 0 else round(price * 1.05, 2)
 
     # ── 6. Ra quyết định dài hạn ──
     if trend_reversed:
