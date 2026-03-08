@@ -214,9 +214,10 @@ def handle_analyze_all(user_id: str, symbols: list, send_fn) -> None:
 
     lines = [f"📊 *Tổng quan danh mục* | {time.strftime('%d/%m %H:%M')}\n"]
 
-    BUY_EMOJIS    = {"MUA_MANH": "🟢🟢", "TICH_LUY": "🟢"}
-    HOLD_EMOJIS   = {"NAM_GIU": "⚪",   "THEO_DOI": "🟡"}
-    EXIT_EMOJIS   = {"CANH_THOAT": "🟠", "THOAT_LENH": "🔴🔴"}
+    # Master key từ bot.py calc_master_decision
+    BUY_EMOJIS    = {"DCA_NGAY": "🟢🟢", "MUA_MANH": "🟢🟢", "TICH_LUY": "🟢"}
+    HOLD_EMOJIS   = {"NAM_GIU": "⚪", "NAM_GIU_CHO": "⚪", "THEO_DOI": "🟡", "THEO_DOI_CHAT": "🟡"}
+    EXIT_EMOJIS   = {"KHONG_DCA": "🔴", "CANH_BAO": "🔴", "CANH_THOAT": "🟠", "THOAT_LENH": "🔴🔴"}
 
     for sym, d in results:
         tp         = d.get("trade_plan", {})
@@ -240,9 +241,17 @@ def handle_analyze_all(user_id: str, symbols: list, send_fn) -> None:
         chg_sign = "+" if chg_pct >= 0 else ""
         price_fmt = f"{price*1000:,.0f}đ" if price < 1000 else f"{price:,.0f}đ"
 
+        cf        = d.get("confluence", {})
+        cf_score  = cf.get("score", 0)
+        ks        = d.get("kelly_size", {})
+        kelly     = ks.get("tier", "NONE")
+        kelly_map = {"STRONG": "💰💰", "NORMAL": "💰", "WEAK": "⚠️", "NONE": ""}
+        kelly_str = kelly_map.get(kelly, "")
+        rev_str   = f" ⚠️{reversal}/5" if reversal >= 2 else ""
+
         line = (
-            f"{emoji} *{sym}* {price_fmt} ({chg_sign}{chg_pct:.1f}%)\n"
-            f"   MTF {mtf_total}/100 | {regime} | Thoát {reversal}/5\n"
+            f"{emoji} *{sym}* {price_fmt} ({chg_sign}{chg_pct:.1f}%) {kelly_str}\n"
+            f"   MTF {mtf_total} | CF {cf_score}/45 | {regime}{rev_str}\n"
             f"   DCA: _{best_zone}_"
         )
         lines.append(line)
@@ -251,12 +260,26 @@ def handle_analyze_all(user_id: str, symbols: list, send_fn) -> None:
         lines.append(f"\n⚠️ Lỗi lấy data: {', '.join(errors)}")
 
     # Thống kê nhanh
-    buy_count  = sum(1 for _, d in results if d.get("trade_plan",{}).get("decision","") in BUY_EMOJIS)
-    exit_count = sum(1 for _, d in results if d.get("trade_plan",{}).get("decision","") in EXIT_EMOJIS)
+    # Dùng master key từ alert.py logic
+    def _master(d):
+        tp = d.get("trade_plan", {}); mtf = d.get("mtf", {}); cf = d.get("confluence", {})
+        rev = tp.get("reversal_count", 0); mtf_t = mtf.get("mtf_total", 0)
+        cf_s = cf.get("score", 0); m_s = mtf.get("monthly_score", 0)
+        dec = tp.get("decision", "")
+        if dec == "THOAT_LENH" or rev >= 3: return "THOAT_LENH"
+        if m_s < 20: return "KHONG_DCA"
+        if mtf_t >= 60 and cf_s >= 20 and rev <= 1: return "DCA_NGAY"
+        if rev == 2 and mtf_t >= 55: return "THEO_DOI_CHAT"
+        if mtf_t < 50: return "CANH_BAO"
+        return "NAM_GIU"
+
+    buy_count  = sum(1 for _, d in results if _master(d) in BUY_EMOJIS)
+    exit_count = sum(1 for _, d in results if _master(d) in EXIT_EMOJIS)
+    kelly_strong = sum(1 for _, d in results if d.get("kelly_size",{}).get("tier") == "STRONG")
     lines.insert(1,
-        f"🟢 Mua/Tích lũy: {buy_count} | "
-        f"⚪ Giữ: {total-buy_count-exit_count} | "
-        f"🔴 Cảnh báo: {exit_count}\n"
+        f"🟢 DCA/Mua: {buy_count} | ⚪ Giữ: {total-buy_count-exit_count} | "
+        f"🔴 Cảnh báo: {exit_count}"
+        + (f" | 💰 Kelly Strong: {kelly_strong}" if kelly_strong else "") + "\n"
     )
 
     send_fn("\n".join(lines))
