@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================
 # bot.py — Telegram Stock Bot với Combo Analysis Engine
+# Source: vnstock VCI (primary) → TCBS → KBS fallback
 # Tự động nhận diện mã cổ phiếu trong bất kỳ tin nhắn nào
 # ============================================================
 import os, re, json, time, logging, requests
@@ -124,7 +125,7 @@ def extract_symbol(text: str):
 
 # ── Format combo result thành Telegram message ──
 def fmt_price(p):
-    """KBS trả về nghìn đồng — nhân 1000 để hiển thị đúng"""
+    """vnstock VCI/TCBS/KBS đều trả về nghìn đồng — nhân 1000 để hiển thị đúng"""
     if p is None: return "—"
     return f"{p*1000:,.0f}đ" if p < 1000 else f"{p:,.0f}đ"
 
@@ -548,7 +549,18 @@ def handle_stock_combo(chat_id, symbol: str):
     combo_msg = format_combo_message(data)
     send_message(chat_id, combo_msg)
 
-    # Nếu score >= 45, thêm Claude insight
+    # Thêm dòng tiền thực intraday nếu có (chỉ trong giờ GD)
+    mf = api_get(f"/moneyflow/{symbol}", timeout=10)
+    if mf and "buy_pct" in mf:
+        net_sign = "+" if mf["net_vol"] >= 0 else ""
+        mf_msg = (
+            f"💹 *Dòng tiền thực ({mf.get('source','')}) — Intraday*\n"
+            f"  Mua chủ động: *{mf['buy_pct']:.1f}%* | Bán: {mf['sell_pct']:.1f}%\n"
+            f"  Net: *{net_sign}{mf['net_vol']/1e6:.1f}M CP* | {mf['dominant']}"
+        )
+        send_message(chat_id, mf_msg)
+
+    # Nếu score >= 40, thêm Claude insight
     if data.get("total_score", 0) >= 40:
         time.sleep(1)
         send_typing(chat_id)
@@ -658,7 +670,7 @@ def main():
     except: pass
 
     send_message(CHAT_ID,
-        "🤖 *Bot đã khởi động lại!*\n\n"
+        "🤖 *Bot đã khởi động lại!* (vnstock v3)\n\n"
         "Chat bất kỳ mã CK để phân tích:\n"
         "`PVT` `FPT` `MBB` `TCB` ...\n\n"
         "Gõ /help để xem hướng dẫn đầy đủ"
