@@ -277,6 +277,356 @@ def get_stock_data(symbol, days=400):
         return None
 
 # ══════════════════════════════════════════════════════════════
+# SMART DCA ENGINE — Hybrid Regime + Confluence Zones
+# ══════════════════════════════════════════════════════════════
+
+def calc_adx(highs, lows, closes, period=14):
+    """ADX — đo độ mạnh xu hướng (không phân biệt lên/xuống)
+    ADX > 25 = trend mạnh | < 20 = sideways
+    """
+    n = len(closes)
+    if n < period * 2:
+        return 20.0
+    plus_dm, minus_dm, tr_list = [], [], []
+    for i in range(1, n):
+        h_diff = highs[i] - highs[i-1]
+        l_diff = lows[i-1] - lows[i]
+        plus_dm.append(h_diff if h_diff > l_diff and h_diff > 0 else 0)
+        minus_dm.append(l_diff if l_diff > h_diff and l_diff > 0 else 0)
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        tr_list.append(tr)
+    # Wilder smoothing
+    def wilder_smooth(data, p):
+        s = [sum(data[:p])]
+        for v in data[p:]:
+            s.append(s[-1] - s[-1]/p + v)
+        return s
+    tr_s    = wilder_smooth(tr_list, period)
+    pdm_s   = wilder_smooth(plus_dm, period)
+    mdm_s   = wilder_smooth(minus_dm, period)
+    dx_vals = []
+    for i in range(len(tr_s)):
+        if tr_s[i] == 0:
+            continue
+        pdi = 100 * pdm_s[i] / tr_s[i]
+        mdi = 100 * mdm_s[i] / tr_s[i]
+        dx  = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) != 0 else 0
+        dx_vals.append(dx)
+    if not dx_vals:
+        return 20.0
+    # ADX = smoothed DX
+    adx_vals = [sum(dx_vals[:period]) / period]
+    for v in dx_vals[period:]:
+        adx_vals.append((adx_vals[-1] * (period-1) + v) / period)
+    return round(adx_vals[-1], 1)
+
+def calc_vwap_rolling(closes, highs, lows, volumes, period=20):
+    """VWAP rolling N ngày — giá trung bình theo khối lượng"""
+    n = len(closes)
+    if n < period:
+        typical = [(highs[i]+lows[i]+closes[i])/3 for i in range(n)]
+        vol_total = sum(volumes)
+        return sum(t*v for t,v in zip(typical, volumes)) / vol_total if vol_total else closes[-1]
+    window_close  = closes[-period:]
+    window_high   = highs[-period:]
+    window_low    = lows[-period:]
+    window_vol    = volumes[-period:]
+    typical = [(window_high[i]+window_low[i]+window_close[i])/3 for i in range(period)]
+    vol_total = sum(window_vol)
+    if vol_total == 0:
+        return closes[-1]
+    return round(sum(t*v for t,v in zip(typical, window_vol)) / vol_total, 2)
+
+def calc_fibonacci(closes, highs, lows, period=60):
+    """Tự động tìm swing high/low trong N ngày, tính Fib retracement
+    Returns dict: fib_382, fib_500, fib_618, swing_high, swing_low
+    """
+    n = min(period, len(closes))
+    recent_highs = highs[-n:]
+    recent_lows  = lows[-n:]
+    swing_high = max(recent_highs)
+    swing_low  = min(recent_lows)
+    diff = swing_high - swing_low
+    if diff == 0:
+        return None
+    return {
+        "swing_high": round(swing_high, 2),
+        "swing_low":  round(swing_low, 2),
+        "fib_236":    round(swing_high - diff * 0.236, 2),
+        "fib_382":    round(swing_high - diff * 0.382, 2),
+        "fib_500":    round(swing_high - diff * 0.500, 2),
+        "fib_618":    round(swing_high - diff * 0.618, 2),
+        "fib_786":    round(swing_high - diff * 0.786, 2),
+    }
+
+def calc_pivot_points(df_weekly):
+    """Weekly Pivot Points từ tuần gần nhất
+    Returns: pivot, s1, s2, r1, r2
+    """
+    if df_weekly is None or len(df_weekly) < 2:
+        return None
+    last_week = df_weekly.iloc[-2]  # tuần hoàn chỉnh gần nhất
+    H = float(last_week['high'])
+    L = float(last_week['low'])
+    C = float(last_week['close'])
+    P  = (H + L + C) / 3
+    S1 = round(2*P - H, 2)
+    S2 = round(P - (H - L), 2)
+    R1 = round(2*P - L, 2)
+    R2 = round(P + (H - L), 2)
+    return {"pivot": round(P,2), "s1": S1, "s2": S2, "r1": R1, "r2": R2}
+
+def calc_volume_profile(closes, highs, lows, volumes, period=60, buckets=20):
+    """Volume Profile — phân bổ volume theo vùng giá trong N ngày
+    Returns: poc (Point of Control), vah (Value Area High), val (Value Area Low)
+    """
+    n = min(period, len(closes))
+    c_w = closes[-n:]; h_w = highs[-n:]; l_w = lows[-n:]; v_w = volumes[-n:]
+    price_min = min(l_w)
+    price_max = max(h_w)
+    if price_max == price_min:
+        return {"poc": closes[-1], "vah": closes[-1], "val": closes[-1]}
+    bucket_size = (price_max - price_min) / buckets
+    histogram = [0.0] * buckets
+    for i in range(n):
+        # Phân bổ volume đều vào các bucket trong range High-Low ngày đó
+        day_min = l_w[i]; day_max = h_w[i]
+        if day_max == day_min:
+            b = min(int((day_min - price_min) / bucket_size), buckets-1)
+            histogram[b] += v_w[i]
+        else:
+            for b in range(buckets):
+                b_low  = price_min + b * bucket_size
+                b_high = b_low + bucket_size
+                overlap = max(0, min(day_max, b_high) - max(day_min, b_low))
+                ratio   = overlap / (day_max - day_min)
+                histogram[b] += v_w[i] * ratio
+    # POC = bucket có volume cao nhất
+    poc_idx  = histogram.index(max(histogram))
+    poc_price = round(price_min + (poc_idx + 0.5) * bucket_size, 2)
+    # Value Area = 70% tổng volume quanh POC
+    total_vol   = sum(histogram)
+    target_vol  = total_vol * 0.70
+    va_vol = histogram[poc_idx]
+    lo_idx = poc_idx; hi_idx = poc_idx
+    while va_vol < target_vol and (lo_idx > 0 or hi_idx < buckets-1):
+        add_lo = histogram[lo_idx-1] if lo_idx > 0 else 0
+        add_hi = histogram[hi_idx+1] if hi_idx < buckets-1 else 0
+        if add_lo >= add_hi and lo_idx > 0:
+            lo_idx -= 1; va_vol += add_lo
+        elif hi_idx < buckets-1:
+            hi_idx += 1; va_vol += add_hi
+        else:
+            break
+    val = round(price_min + lo_idx * bucket_size, 2)
+    vah = round(price_min + (hi_idx+1) * bucket_size, 2)
+    return {"poc": poc_price, "vah": vah, "val": val}
+
+def detect_regime(closes, highs, lows, volumes, adx_val):
+    """Nhận diện Market Regime
+    TRENDING  : ADX>25 + EMA stack thẳng
+    BREAKOUT  : Vol surge + giá phá đỉnh 20 ngày
+    RANGING   : ADX<20 + giá dao động kênh
+    TRANSITION: Còn lại
+    """
+    n = len(closes)
+    # EMA stack
+    ema9_s  = ema(closes, 9)
+    ema20_s = ema(closes, 20)
+    ema50_s = ema(closes, 50)
+    e9  = next((x for x in reversed(ema9_s)  if x is not None), closes[-1])
+    e20 = next((x for x in reversed(ema20_s) if x is not None), closes[-1])
+    e50 = next((x for x in reversed(ema50_s) if x is not None), closes[-1])
+    ema_stack = e9 > e20 > e50 and closes[-1] > e9
+
+    # Volume surge (vs TB20)
+    vol_avg20 = sum(volumes[-20:]) / min(20, n)
+    vol_surge = volumes[-1] > vol_avg20 * 1.8
+
+    # Breakout: giá hôm nay > max 20 ngày trước
+    high_20d  = max(highs[-21:-1]) if n > 21 else max(highs[:-1])
+    breakout  = closes[-1] > high_20d * 1.005 and vol_surge
+
+    # Ranging: giá trong kênh hẹp (range 20 ngày < 15%)
+    high_20  = max(highs[-20:])
+    low_20   = min(lows[-20:])
+    range_20_pct = (high_20 - low_20) / low_20 * 100 if low_20 > 0 else 20
+
+    if breakout:
+        regime = "BREAKOUT"
+        regime_note = f"Giá phá đỉnh {high_20d:,.2f} với vol surge — momentum mạnh"
+    elif adx_val > 25 and ema_stack:
+        regime = "TRENDING"
+        regime_note = f"ADX={adx_val:.0f} (>25) + EMA stack thẳng — xu hướng tăng rõ"
+    elif adx_val < 20 and range_20_pct < 15:
+        regime = "RANGING"
+        regime_note = f"ADX={adx_val:.0f} (<20) + range 20 ngày {range_20_pct:.1f}% — tích lũy ngang"
+    else:
+        regime = "TRANSITION"
+        regime_note = f"ADX={adx_val:.0f} — chuyển tiếp, chưa rõ xu hướng"
+
+    return regime, regime_note
+
+def calc_smart_dca(closes, highs, lows, volumes, df_weekly,
+                   ema9, ema20, ema50, bb_lower, bb_mid, bb_upper,
+                   st_val, vwap_daily):
+    """Hybrid Regime + Confluence DCA
+    1. Tính ADX + nhận diện regime
+    2. Thu thập tất cả mức giá từ 7 nguồn (tùy regime)
+    3. Cluster các mức gần nhau (±1.5%)
+    4. Rank cluster → chọn 1 vùng DCA tốt nhất
+    5. Nếu zone xa >8% → thêm breakout entry
+    """
+    current_price = closes[-1]
+    adx_val = calc_adx(highs, lows, closes, 14)
+    regime, regime_note = detect_regime(closes, highs, lows, volumes, adx_val)
+
+    # ── Thu thập tất cả mức giá tiềm năng ──
+    # Format: (price, source_name, weight)
+    # Weight: POC=3, VWAP=2, EMA/ST/Fib/Pivot=1
+    all_levels = []
+
+    def add(price, name, weight=1):
+        if price and price > 0:
+            all_levels.append((round(price, 2), name, weight))
+
+    # VWAP20
+    vwap20 = calc_vwap_rolling(closes, highs, lows, volumes, 20)
+    add(vwap20, "VWAP20", 2)
+
+    # Volume Profile POC/VAL
+    vp = calc_volume_profile(closes, highs, lows, volumes, 60)
+    if vp:
+        add(vp["poc"], "POC", 3)
+        add(vp["val"], "VAL", 2)
+
+    # Fibonacci retracement
+    fib = calc_fibonacci(closes, highs, lows, 60)
+    if fib:
+        add(fib["fib_382"], "Fib 38.2%", 1)
+        add(fib["fib_500"], "Fib 50%",   1)
+        add(fib["fib_618"], "Fib 61.8%", 1)
+
+    # Weekly Pivot Points
+    pp = calc_pivot_points(df_weekly)
+    if pp:
+        add(pp["s1"], "Pivot S1", 1)
+        add(pp["s2"], "Pivot S2", 1)
+
+    # SuperTrend level
+    if st_val:
+        add(st_val, "SuperTrend", 1)
+
+    # EMA levels — tùy regime
+    if regime in ("TRENDING", "BREAKOUT", "TRANSITION"):
+        add(ema9,  "EMA9",  1)
+        add(ema20, "EMA20", 1)
+    if regime in ("RANGING", "TRANSITION"):
+        add(ema20, "EMA20", 1)
+        add(ema50, "EMA50", 1)
+        if bb_mid:   add(bb_mid,   "BB Mid",   1)
+        if bb_lower: add(bb_lower, "BB Lower", 1)
+    if regime == "TRENDING":
+        add(ema50, "EMA50", 1)
+
+    # ── Cluster các mức giá gần nhau (±1.5%) ──
+    # Chỉ lấy các mức DƯỚI hoặc bằng giá hiện tại (vùng hỗ trợ, không phải kháng cự)
+    support_levels = [(p, n, w) for p, n, w in all_levels if p <= current_price * 1.005]
+    support_levels.sort(key=lambda x: x[0], reverse=True)  # gần giá nhất trước
+
+    clusters = []
+    used = [False] * len(support_levels)
+    for i, (p, n, w) in enumerate(support_levels):
+        if used[i]:
+            continue
+        cluster = [(p, n, w)]
+        used[i] = True
+        for j, (p2, n2, w2) in enumerate(support_levels):
+            if used[j]:
+                continue
+            if abs(p2 - p) / p <= 0.015:  # ±1.5% tolerance
+                cluster.append((p2, n2, w2))
+                used[j] = True
+        clusters.append(cluster)
+
+    if not clusters:
+        # Fallback: dùng EMA20 nếu không có cluster nào
+        return {
+            "regime":        regime,
+            "regime_note":   regime_note,
+            "adx":           adx_val,
+            "best_zone_low":  round(ema20 * 0.99, 2),
+            "best_zone_high": round(ema20 * 1.01, 2),
+            "best_zone_str":  f"{round(ema20*0.99,2):,.2f}–{round(ema20*1.01,2):,.2f}",
+            "best_zone_sources": ["EMA20 (fallback)"],
+            "best_zone_stars":   "⭐",
+            "best_zone_dist_pct": round((ema20 - current_price) / current_price * 100, 1),
+            "breakout_entry": None,
+            "fib":   fib,
+            "pivot": pp,
+            "vp":    vp,
+        }
+
+    # ── Rank mỗi cluster ──
+    def score_cluster(cluster):
+        num_sources = len(cluster)
+        weight_sum  = sum(w for _, _, w in cluster)
+        # Bonus cho POC và VWAP
+        has_poc  = any("POC"  in n for _, n, _ in cluster)
+        has_vwap = any("VWAP" in n for _, n, _ in cluster)
+        # Ưu tiên gần giá hơn (regime trending: không quá xa)
+        center = sum(p for p, _, _ in cluster) / len(cluster)
+        dist_pct = abs(center - current_price) / current_price * 100
+        proximity_bonus = max(0, 5 - dist_pct)  # gần hơn = bonus cao hơn
+        return weight_sum + (2 if has_poc else 0) + (1 if has_vwap else 0) + proximity_bonus * 0.3
+
+    clusters.sort(key=score_cluster, reverse=True)
+    best = clusters[0]
+
+    # ── Tính vùng giá từ cluster tốt nhất ──
+    prices  = [p for p, _, _ in best]
+    sources = [n for _, n, _ in best]
+    zone_center = sum(prices) / len(prices)
+    zone_low    = round(min(prices) * 0.995, 2)
+    zone_high   = round(max(prices) * 1.005, 2)
+    dist_pct    = round((zone_center - current_price) / current_price * 100, 1)
+
+    # Stars rating
+    n_sources = len(best)
+    if n_sources >= 4:   stars = "⭐⭐⭐⭐"
+    elif n_sources == 3: stars = "⭐⭐⭐"
+    elif n_sources == 2: stars = "⭐⭐"
+    else:                stars = "⭐"
+
+    # ── Breakout entry nếu zone xa >8% ──
+    breakout_entry = None
+    if dist_pct < -8:
+        # Mức breakout = đỉnh gần nhất + 0.5%
+        recent_high = max(highs[-10:])
+        breakout_price = round(recent_high * 1.005, 2)
+        if breakout_price > current_price:
+            breakout_entry = {
+                "price":  breakout_price,
+                "note":   f"Mua breakout khi vượt {breakout_price:,.2f} kèm vol > 1.5× TB20",
+            }
+
+    return {
+        "regime":             regime,
+        "regime_note":        regime_note,
+        "adx":                adx_val,
+        "best_zone_low":      zone_low,
+        "best_zone_high":     zone_high,
+        "best_zone_str":      f"{zone_low:,.2f}–{zone_high:,.2f}",
+        "best_zone_sources":  sources,
+        "best_zone_stars":    stars,
+        "best_zone_dist_pct": dist_pct,
+        "breakout_entry":     breakout_entry,
+        "fib":                fib,
+        "pivot":              pp,
+        "vp":                 vp,
+    }
+
+# ══════════════════════════════════════════════════════════════
 # MTF HELPERS — Resample & Score từng khung thời gian
 # ══════════════════════════════════════════════════════════════
 
@@ -874,29 +1224,34 @@ def run_combo_analysis(symbol):
     reversal_count  = sum(exit_signals.values())
     trend_reversed  = reversal_count >= 3
 
-    # ── 4. Vùng DCA 3 tầng — mua theo pullback ──
-    # Tầng 1 — Mua lý tưởng: pullback về EMA20 (hỗ trợ ngắn hạn)
-    dca_zone1_low  = round(ema20 * 0.99, 2)
-    dca_zone1_high = round(ema20 * 1.01, 2)
-    # Tầng 2 — Mua tốt: pullback về EMA50 (hỗ trợ trung hạn)
-    dca_zone2_low  = round(ema50 * 0.99, 2)
-    dca_zone2_high = round(ema50 * 1.01, 2)
-    # Tầng 3 — Mua mạnh tay: về BB lower / vùng oversold (cơ hội DCA tốt nhất)
-    dca_zone3_low  = round(bb_lower * 0.99, 2) if bb_lower else round(ema50 * 0.94, 2)
-    dca_zone3_high = round(bb_lower * 1.01, 2) if bb_lower else round(ema50 * 0.96, 2)
+    # ── 4. Smart DCA — Hybrid Regime + Confluence ──
+    # Weekly resample cho Pivot Points
+    try:
+        df_weekly_rs = df.copy()
+        df_weekly_rs['time'] = pd.to_datetime(df_weekly_rs['time'])
+        df_weekly_rs = df_weekly_rs.set_index('time').resample('W-FRI').agg({
+            'open': 'first', 'high': 'max', 'low': 'min',
+            'close': 'last', 'volume': 'sum'
+        }).dropna().reset_index()
+    except Exception:
+        df_weekly_rs = None
 
-    # Giá hiện tại đang ở tầng nào?
+    vwap_daily = calc_vwap_rolling(closes, highs, lows, volumes, 20)
+
+    smart_dca = calc_smart_dca(
+        closes, highs, lows, volumes, df_weekly_rs,
+        ema9, ema20, ema50, bb_lower, bb_mid, bb_upper,
+        st_val, vwap_daily
+    )
+
+    best_zone_str = smart_dca["best_zone_str"]
+    best_dist     = smart_dca["best_zone_dist_pct"]
+    dist_note_dca = (
+        f"Giá đang ở trong vùng DCA" if abs(best_dist) < 1
+        else f"Cách vùng DCA: {best_dist:+.1f}%"
+    )
     dist_ema20_pct = round((latest_close - ema20) / ema20 * 100, 1)
     dist_ema50_pct = round((latest_close - ema50) / ema50 * 100, 1)
-    if latest_close <= dca_zone3_high:
-        dca_current_zone = "TẦNG 3 🔥 (vùng oversold — mua mạnh nhất)"
-    elif latest_close <= dca_zone2_high:
-        dca_current_zone = "TẦNG 2 ✅ (EMA50 — mua tốt)"
-    elif latest_close <= dca_zone1_high:
-        dca_current_zone = "TẦNG 1 ✅ (EMA20 — mua lý tưởng)"
-    else:
-        gap_to_ema20 = dist_ema20_pct
-        dca_current_zone = f"Trên vùng DCA ({gap_to_ema20:+.1f}% so EMA20) — chờ pullback"
 
     # ── 5. Vùng hỗ trợ & kháng cự động ──
     # Hỗ trợ = mức GIÁ DƯỚI giá hiện tại; kháng cự = mức TRÊN giá hiện tại
@@ -934,31 +1289,31 @@ def run_combo_analysis(symbol):
         decision      = "MUA_MANH"
         decision_vi   = "🟢🟢 MUA MẠNH / TĂNG TỶ TRỌNG"
         decision_note = "Xu hướng rất mạnh, dòng tiền vào rõ ràng — thời điểm tốt để tích lũy"
-        action_detail = f"Mua ngay hoặc chờ pullback về Tầng 1: {dca_zone1_low:,.2f}–{dca_zone1_high:,.2f}"
+        action_detail = f"DCA vào vùng tốt nhất: {best_zone_str}"
 
     elif total_score >= 55 and trend_confirmed:
         decision      = "TICH_LUY"
         decision_vi   = "🟢 TÍCH LŨY / MUA THÊM"
-        decision_note = "Xu hướng tăng xác nhận — tích lũy theo DCA khi giá về vùng EMA"
-        action_detail = f"DCA tại Tầng 1 ({dca_zone1_low:,.2f}–{dca_zone1_high:,.2f}) hoặc Tầng 2 ({dca_zone2_low:,.2f}–{dca_zone2_high:,.2f})"
+        decision_note = "Xu hướng tăng xác nhận — tích lũy theo DCA khi giá về vùng hội tụ"
+        action_detail = f"DCA vào vùng tốt nhất: {best_zone_str}"
 
     elif hold_ok:
         decision      = "NAM_GIU"
         decision_vi   = "⚪ NẮM GIỮ VỮNG"
         decision_note = "Chỉ báo tích cực, xu hướng còn nguyên — không có lý do bán"
-        action_detail = f"Tiếp tục giữ. Có thể DCA thêm nếu giá về Tầng 2: {dca_zone2_low:,.2f}–{dca_zone2_high:,.2f}"
+        action_detail = f"Tiếp tục giữ. DCA thêm nếu giá về vùng: {best_zone_str}"
 
     elif trend_weak and not money_flow_out:
         decision      = "THEO_DOI"
         decision_vi   = "🟡 THEO DÕI — GIỮ CÓ ĐIỀU KIỆN"
         decision_note = "Xu hướng yếu dần nhưng chưa đảo chiều — không mua thêm, theo dõi chặt"
-        action_detail = f"Giữ nếu chưa phá EMA50 ({support_2:,.2f}). Sẵn sàng thoát nếu thêm tín hiệu xấu"
+        action_detail = f"Giữ nếu chưa phá EMA50 ({ema50:,.2f}). Sẵn sàng thoát nếu thêm tín hiệu xấu"
 
     else:
         decision      = "TRANH_XA"
         decision_vi   = "🔴 TRÁNH XA — CHƯA VÀO"
         decision_note = "Xu hướng không rõ hoặc đang tích lũy đáy — chưa phải thời điểm"
-        action_detail = f"Chờ giá ổn định và xác nhận lại trên EMA50 ({support_2:,.2f}) với volume tốt"
+        action_detail = f"Chờ giá ổn định và xác nhận lại trên EMA50 ({ema50:,.2f}) với volume tốt"
 
     # ── 7. Trạng thái giữ ──
     if hold_ok and not trend_reversed:
@@ -996,13 +1351,12 @@ def run_combo_analysis(symbol):
         "hold_status":        hold_status,
         "hold_reason":        hold_reason,
         "hold_ok":            bool(hold_ok),
-        # Vùng DCA 3 tầng
-        "dca_zone1":          f"{dca_zone1_low:,.2f}–{dca_zone1_high:,.2f}",
-        "dca_zone2":          f"{dca_zone2_low:,.2f}–{dca_zone2_high:,.2f}",
-        "dca_zone3":          f"{dca_zone3_low:,.2f}–{dca_zone3_high:,.2f}",
-        "dca_current_zone":   dca_current_zone,
-        "dca_note":           f"Tầng 1 (EMA20) | Tầng 2 (EMA50) | Tầng 3 (BB Lower)",
-        # Khoảng cách giá vs EMA
+        # Smart DCA — vùng tốt nhất (tham chiếu từ smart_dca)
+        "dca_best_zone":      best_zone_str,
+        "dca_dist_pct":       best_dist,
+        "dca_current_zone":   dist_note_dca,
+        "dca_note":           f"Regime: {smart_dca['regime']} | {len(smart_dca['best_zone_sources'])} chỉ báo hội tụ",
+        # Khoảng cách giá vs EMA (phụ)
         "dist_ema20_pct":     dist_ema20_pct,
         "dist_ema50_pct":     dist_ema50_pct,
         "dist_note":          f"Cách EMA20: {dist_ema20_pct:+.1f}% | Cách EMA50: {dist_ema50_pct:+.1f}%",
@@ -1078,6 +1432,7 @@ def run_combo_analysis(symbol):
                            calc_rsi_series(closes, 14),
                            ema20, ema50, symbol
                        ),
+        "smart_dca":   smart_dca,
     }, None
 
 # ══════════════════════════════════════════════════════════════
