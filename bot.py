@@ -321,74 +321,6 @@ def format_combo_message(d: dict) -> str:
 
     return "\n".join(lines)
 
-    lines = [
-        f"{'━'*34}",
-        f"📊 *{sym}* | {date}",
-        f"{chg_arrow} Giá: *{fmt_price(price)}* ({chg_sign}{chg_pct:.1f}%)",
-        f"📦 Vol: {d['volume']/1e6:.1f}M ({d['vol_ratio']:.1f}x TB20)",
-        f"{'━'*34}",
-        f"",
-        # ── MASTER DECISION — to nhất, rõ nhất ──
-        f"🏁 *QUYẾT ĐỊNH: {master_vi}*",
-        f"_{master_reason}_",
-        f"➡️ *{master_action}*",
-        f"",
-        f"{'━'*34}",
-        f"",
-        # ── MTF Score 3 khung ──
-        f"🌐 *MTF: {mtf_total}/100* `{bar_mtf}`",
-        f"  M *{mtf.get('monthly_score',0)}* | W *{mtf.get('weekly_score',0)}* | D *{score}*",
-        f"  M: _{mtf.get('monthly_note','')}_",
-        f"  W: _{mtf.get('weekly_note','')}_",
-    ]
-
-    if mtf.get("monthly_warning"):
-        lines.append(f"  {mtf.get('monthly_warning')}")
-
-    lines += [
-        f"",
-        # ── Confluence ──
-        f"🔍 *Confluence: {cf_score}/40 — {cf.get('level','')}*",
-    ]
-    for sig_name, sig_val in cf.get("signals", {}).items():
-        # Rút gọn: bỏ tên signal key, chỉ giữ value
-        lines.append(f"  {sig_val}")
-
-    lines += [
-        f"",
-        f"{'─'*34}",
-        # ── Vùng DCA ──
-        f"💰 *VÙNG DCA:*",
-        f"  🟢 Tầng 1 (EMA20): *{tp.get('dca_zone1','—')}*",
-        f"  🟡 Tầng 2 (EMA50): *{tp.get('dca_zone2','—')}*",
-        f"  🔵 Tầng 3 (BB Low): *{tp.get('dca_zone3','—')}*",
-        f"  📍 _{tp.get('dca_current_zone','')}_ | _{tp.get('dist_note','')}_",
-        f"",
-        # ── Hỗ trợ & Kháng cự ──
-        f"📐 *Hỗ trợ:* {fmt_price(tp.get('support_1'))} → {fmt_price(tp.get('support_2'))} → {fmt_price(tp.get('support_3'))}",
-        f"📐 *Kháng cự:* {fmt_price(tp.get('resistance'))}",
-        f"",
-    ]
-
-    # ── Tín hiệu thoát — chỉ hiện khi có cảnh báo ──
-    if reversal >= 1:
-        bad_signals = [sig for sig, st in tp.get("reversal_detail", {}).items() if "XẤU" in st]
-        lines += [
-            f"⚠️ *Cảnh báo thoát ({reversal}/5):* {' | '.join(bad_signals)}",
-            f"",
-        ]
-
-    lines += [
-        f"{'━'*34}",
-        # ── Kỹ thuật daily gọn ──
-        f"📈 *Daily: {score}/100* `{bar_daily}` | ST: *{d['supertrend']}* | RSI {d['rsi14']:.0f}",
-        f"C1:{d['combo1']['score']}% C2:{d['combo2']['score']}% C3:{d['combo3']['score']}% C4:{d['combo4']['score']}% C5:{d['combo5']['score']}%",
-        f"EMA {d['ema9']:.1f}/{d['ema20']:.1f}/{d['ema50']:.1f} | OBV:{d['obv_trend']} CMF:{d['cmf20']:+.3f}",
-        f"Dòng tiền: *{tp.get('money_flow','—')}* | Trend: *{tp.get('trend_quality','—')}*",
-    ]
-
-    return "\n".join(lines)
-
 
     return "\n".join(lines)
 
@@ -421,14 +353,21 @@ def claude_with_combo(symbol: str, d: dict) -> str:
     cf   = d.get("confluence", {})
     sdca = d.get("smart_dca", {})
 
+    # Tính MASTER decision để truyền vào Claude — bắt buộc nhất quán
+    master_vi, master_reason, master_action = calc_master_decision(mtf, tp, cf)
+    # Rút gọn về action keyword
+    if "DCA" in master_vi:
+        master_action_key = "MUA THÊM / DCA"
+    elif "THOÁT" in master_vi:
+        master_action_key = "THOÁT LỆNH"
+    else:
+        master_action_key = "NẮM GIỮ"
+
     reversal_lines = "\n".join(
         f"  {status}: {sig}" for sig, status in tp.get("reversal_detail", {}).items()
     )
-    cf_lines = "\n".join(
-        f"  {v}" for v in cf.get("signals", {}).values()
-    )
+    cf_lines = "\n".join(f"  {v}" for v in cf.get("signals", {}).values())
 
-    # Smart DCA context
     regime      = sdca.get("regime", "—")
     best_zone   = sdca.get("best_zone_str", "—")
     best_stars  = sdca.get("best_zone_stars", "")
@@ -439,20 +378,37 @@ def claude_with_combo(symbol: str, d: dict) -> str:
     pivot       = sdca.get("pivot") or {}
     vp          = sdca.get("vp") or {}
 
-    breakout_line = f"- Breakout entry: {fmt_price(breakout['price'])} ({breakout['note']})" if breakout else ""
-    fib_line = (f"- Fib 38.2%/50%/61.8%: {fmt_price(fib.get('fib_382'))}/{fmt_price(fib.get('fib_500'))}/{fmt_price(fib.get('fib_618'))}"
-                if fib else "")
+    breakout_line = (f"- Breakout entry: {fmt_price(breakout['price'])} — {breakout['note']}"
+                     if breakout else "")
+    fib_line  = (f"- Fib 38.2%/50%/61.8%: {fmt_price(fib.get('fib_382'))}/{fmt_price(fib.get('fib_500'))}/{fmt_price(fib.get('fib_618'))}"
+                 if fib else "")
     pivot_line = (f"- Pivot S1/S2: {fmt_price(pivot.get('s1'))}/{fmt_price(pivot.get('s2'))}"
                   if pivot else "")
-    poc_line = (f"- Volume POC/VAL: {fmt_price(vp.get('poc'))}/{fmt_price(vp.get('val'))}"
-                if vp else "")
+    poc_line  = (f"- Volume POC: {fmt_price(vp.get('poc'))} | VAL: {fmt_price(vp.get('val'))}"
+                 if vp else "")
+
+    # Liệt kê 5 tín hiệu thoát rõ ràng để Claude dùng đúng
+    exit_5_signals = (
+        "Hệ thống 5 tín hiệu thoát (cần ≥3/5 để xác nhận):\n"
+        "  1. SuperTrend đổi BEAR\n"
+        "  2. EMA20 cắt xuống EMA50 (death cross)\n"
+        "  3. Giá đóng cửa dưới EMA50\n"
+        "  4. RSI < 40 + Momentum 5 ngày < -3%\n"
+        "  5. OBV giảm + MFI < 45\n"
+        f"  Hiện tại: {tp.get('reversal_count',0)}/5 tín hiệu đang xấu"
+    )
 
     prompt = (
         f"Phân tích dài hạn {symbol} ngày {d['date']}:\n"
-        f"- Giá hiện tại: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n"
+        f"- Giá: {fmt_price(d['price'])} | Thay đổi: {d['change_pct']:+.1f}%\n"
         f"- EMA9/20/50: {fmt_price(d['ema9'])}/{fmt_price(d['ema20'])}/{fmt_price(d['ema50'])}\n"
         f"- BB Upper/Lower: {fmt_price(d.get('bb_upper'))}/{fmt_price(d.get('bb_lower'))}\n\n"
-        f"[MTF: {mtf.get('mtf_total',0)}/100 — {mtf.get('decision_vi','')}]\n"
+        f"[MASTER DECISION — BẮT BUỘC NHẤT QUÁN]\n"
+        f"- Quyết định hệ thống: {master_vi}\n"
+        f"- Lý do: {master_reason}\n"
+        f"- Action: {master_action}\n"
+        f"⚠️ Quyết định của bạn PHẢI là '{master_action_key}' — không được mâu thuẫn với hệ thống.\n\n"
+        f"[MTF: {mtf.get('mtf_total',0)}/100]\n"
         f"- Monthly {mtf.get('monthly_score',0)}: {mtf.get('monthly_note','')}\n"
         f"- Weekly  {mtf.get('weekly_score',0)}: {mtf.get('weekly_note','')}\n"
         f"- Daily   {d['total_score']}: {tp.get('decision_vi','')}\n"
@@ -461,21 +417,21 @@ def claude_with_combo(symbol: str, d: dict) -> str:
         f"{cf_lines}\n\n"
         f"[KỸ THUẬT]\n"
         f"- ST: {d['supertrend']} | RSI: {d['rsi14']:.1f} | MACD: {d['macd']:+.3f} | OBV: {d['obv_trend']}\n"
-        f"- Tín hiệu thoát ({tp.get('reversal_count',0)}/5):\n{reversal_lines}\n\n"
+        f"{exit_5_signals}\n\n"
         f"[SMART DCA — Regime: {regime} | {best_stars}]\n"
-        f"- Vùng DCA tốt nhất: {best_zone} ({best_dist:+.1f}% từ giá hiện tại)\n"
+        f"- Vùng DCA tốt nhất: {best_zone} ({best_dist:+.1f}% từ giá)\n"
         f"- Chỉ báo hội tụ: {best_sources}\n"
         f"{fib_line}\n{pivot_line}\n{poc_line}\n"
         f"{breakout_line}\n"
         f"- Hỗ trợ: {fmt_price(tp.get('support_1'))} / {fmt_price(tp.get('support_2'))} / {fmt_price(tp.get('support_3'))}\n"
         f"- Kháng cự: {fmt_price(tp.get('resistance'))}\n\n"
-        f"Yêu cầu output CHÍNH XÁC theo format sau (không thêm bớt):\n"
-        f"Quyết định: [MUA THÊM 🟢 / NẮM GIỮ ⚪ / THOÁT 🔴]\n"
-        f"📌 Giá mua / DCA: [dùng vùng Smart DCA ở trên, ghi rõ lý do chỉ báo hội tụ]\n"
+        f"Yêu cầu output CHÍNH XÁC format sau:\n"
+        f"Quyết định: {master_action_key} [emoji]\n"
+        f"📌 Giá mua / DCA: [vùng {best_zone} — ghi rõ chỉ báo hội tụ]\n"
         f"📌 Giá vào lệnh mới: [vùng DCA tốt nhất nếu chưa có vị thế]\n"
-        f"📌 Chốt lời một phần: [mức kháng cự gần nhất hoặc 'Chưa — tiếp tục giữ']\n"
-        f"📌 Thoát lệnh khi: [điều kiện chỉ báo cụ thể, KHÔNG dùng giá cố định]\n"
-        f"[1-2 câu nhận định ngắn gọn lý do và rủi ro chính]"
+        f"📌 Chốt lời một phần: [kháng cự {fmt_price(tp.get('resistance'))} hoặc 'Chưa — tiếp tục giữ']\n"
+        f"📌 Thoát lệnh khi: [dùng đúng 5 tín hiệu hệ thống, nêu cụ thể tín hiệu nào cần kích hoạt]\n"
+        f"[1-2 câu lý do chính và rủi ro lớn nhất cần theo dõi]"
     )
     return ask_claude(prompt)
 
